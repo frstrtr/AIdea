@@ -24,8 +24,10 @@ from pydantic import BaseModel, Field
 from aidea import (
     CARD_DEPTH_BY_NAME,
     CARD_DEPTHS,
+    EINSTEIN_MECHANISMS,
     ENTROPY_LEVELS,
     Card,
+    build_einstein_prompt,
     build_prompt,
     cards_from_static_bank,
     critic_score,
@@ -57,6 +59,7 @@ class GenerateRequest(BaseModel):
     bank: str | None = None  # path to static JSON bank; bypasses deck-gen
     bank_data: dict[str, list[str]] | None = None  # inline static bank
     refine: bool = False  # score ideas + refine the winner at low entropy
+    einstein: bool = False  # four mechanism-specific passes instead of n_ideas
 
 
 # ---------------------------------------------------------------------------
@@ -176,23 +179,45 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
     # --- Stage 1 & 2: sample + synthesize, per idea -----------------------
     rng = random.Random(req.seed)
     ideas: list[str] = []
-    for i in range(req.n_ideas):
+    mechanism_labels: list[str | None] = []
+
+    if req.einstein:
+        passes = [
+            (key, mech["label"], mech["blurb"])
+            for key, mech in EINSTEIN_MECHANISMS.items()
+        ]
+    else:
+        passes = [(None, None, None) for _ in range(req.n_ideas)]
+
+    for i, (mech_key, mech_label, mech_blurb) in enumerate(passes):
         cards = sample_cards(deck=deck, n=req.n_concepts, spread=spread, rng=rng)
         yield _sse("sample", {
             "i": i,
             "level": level.name,
             "spread": spread,
+            "mechanism": mech_label,
+            "mechanism_blurb": mech_blurb,
             "cards": [_card_to_dict(c) for c in cards],
         })
 
         synth_phase = f"synth-{i}"
+        synth_msg = (
+            f"Synthesizing idea {i + 1}/{len(passes)} "
+            f"via {mech_label} mechanism..."
+            if mech_label
+            else f"Synthesizing idea {i + 1}/{len(passes)}..."
+        )
         yield _sse("status", {
             "phase": synth_phase,
             "i": i,
-            "message": f"Synthesizing idea {i + 1}/{req.n_ideas}...",
+            "message": synth_msg,
         })
 
-        prompt = build_prompt(req.topic, cards, level)
+        if mech_key is not None:
+            prompt = build_einstein_prompt(req.topic, cards, mech_key)
+        else:
+            prompt = build_prompt(req.topic, cards, level)
+
         idea: str | None = None
         try:
             async for kind, payload in _watched(
@@ -208,8 +233,13 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             return
         assert idea is not None
 
-        yield _sse("idea", {"i": i, "text": idea})
         ideas.append(idea)
+        mechanism_labels.append(mech_label)
+        yield _sse("idea", {
+            "i": i,
+            "text": idea,
+            "mechanism": mech_label,
+        })
 
     # --- Stage 3: critic + refinement (optional) --------------------------
     if req.refine and ideas:
@@ -238,6 +268,10 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             assert score is not None
             score["i"] = i
             score["total"] = total_score(score)
+            score["mechanism"] = (
+                mechanism_labels[i]
+                if i < len(mechanism_labels) else None
+            )
             scored.append(score)
             yield _sse("score", score)
 
@@ -246,6 +280,7 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             "i": winner["i"],
             "total": winner["total"],
             "notes": winner.get("notes", ""),
+            "mechanism": winner.get("mechanism"),
         })
 
         yield _sse("status", {
@@ -394,6 +429,12 @@ INDEX_HTML = r"""<!doctype html>
   .meta { color: #777; font-size: 0.8rem; margin-bottom: 0.3rem; }
   .meta.refined-meta { color: #1a8a4f; font-weight: 600; letter-spacing: 0.05em;
                        text-transform: uppercase; }
+  .mech-tag { display: inline-block; margin-left: 0.4rem; padding: 0.05rem 0.45rem;
+              background: #2c3e75; color: #fff; border-radius: 999px;
+              font-size: 0.7rem; letter-spacing: 0.04em; text-transform: uppercase;
+              font-weight: 600; }
+  .mech-blurb { color: #666; font-size: 0.85rem; font-style: italic;
+                margin: 0.15rem 0 0.45rem; }
   .error { color: #b00020; border-left-color: #b00020; }
   .score-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.2rem 0 0.4rem; }
   .score-pill { background: #eee; color: #333; border-radius: 999px;
@@ -487,6 +528,11 @@ INDEX_HTML = r"""<!doctype html>
     Critic + refine winner (extra calls: 1 score per idea, 1 refinement)
   </label>
 
+  <label class="inline">
+    <input type="checkbox" name="einstein">
+    Einstein mode — four mechanisms (Adjacent Possible · Exaptation · Slow Hunch · Productive Error). Overrides n_ideas to 4.
+  </label>
+
   <details class="advanced">
     <summary>Bring your own deck (optional)</summary>
     <label>
@@ -519,7 +565,7 @@ form.addEventListener('submit', async (e) => {
   for (const [k, v] of fd.entries()) {
     if (v === '') continue;
     if (['cards','n_concepts','n_ideas','seed'].includes(k)) payload[k] = Number(v);
-    else if (k === 'regen_deck' || k === 'refine') payload[k] = true;
+    else if (k === 'regen_deck' || k === 'refine' || k === 'einstein') payload[k] = true;
     else if (k === 'bank_data') {
       try {
         payload.bank_data = JSON.parse(v);
@@ -599,23 +645,37 @@ function handleEvent(chunk) {
     );
   } else if (event === 'sample') {
     const cardHtml = obj.cards.map(renderCard).join('');
+    const mechTag = obj.mechanism
+      ? '<span class="mech-tag">' + escapeHtml(obj.mechanism) + '</span>'
+      : '';
+    const blurb = obj.mechanism_blurb
+      ? '<div class="mech-blurb">' + escapeHtml(obj.mechanism_blurb) + '</div>'
+      : '';
     addPanel(
       '<div class="meta">Drawn for idea ' + (obj.i + 1) +
       ' — entropy=' + escapeHtml(obj.level) +
-      ' (spread=' + obj.spread.toFixed(2) + ')</div>' +
+      ' (spread=' + obj.spread.toFixed(2) + ')' +
+      mechTag + '</div>' +
+      blurb +
       cardHtml
     );
   } else if (event === 'idea') {
     finishStatus('synth-' + obj.i, 'idea ' + (obj.i + 1) + ' ready');
+    const mechTag = obj.mechanism
+      ? '<span class="mech-tag">' + escapeHtml(obj.mechanism) + '</span>'
+      : '';
     addPanel(
-      '<div class="meta">Idea ' + (obj.i + 1) + '</div>' +
+      '<div class="meta">Idea ' + (obj.i + 1) + mechTag + '</div>' +
       '<div class="idea"><pre>' + escapeHtml(obj.text) + '</pre></div>'
     );
   } else if (event === 'score') {
     finishStatus('critic-' + obj.i,
                  'idea ' + (obj.i + 1) + ' scored ' + obj.total + '/300');
+    const mechTag = obj.mechanism
+      ? '<span class="mech-tag">' + escapeHtml(obj.mechanism) + '</span>'
+      : '';
     addPanel(
-      '<div class="meta">Score · idea ' + (obj.i + 1) + '</div>' +
+      '<div class="meta">Score · idea ' + (obj.i + 1) + mechTag + '</div>' +
       '<div class="score-row">' +
         '<span class="score-pill">feasibility ' + obj.feasibility + '</span>' +
         '<span class="score-pill">unexpectedness ' + obj.unexpectedness + '</span>' +
@@ -625,10 +685,13 @@ function handleEvent(chunk) {
       (obj.notes ? '<div class="critic-notes">' + escapeHtml(obj.notes) + '</div>' : '')
     );
   } else if (event === 'winner') {
+    const mechSuffix = obj.mechanism
+      ? ' · ' + escapeHtml(obj.mechanism) + ' mechanism wins'
+      : '';
     addPanel(
       '<div class="meta">Winner</div>' +
       '<div class="winner-banner">Idea ' + (obj.i + 1) +
-      ' wins with ' + obj.total + '/300</div>' +
+      ' wins with ' + obj.total + '/300' + mechSuffix + '</div>' +
       (obj.notes ? '<div class="critic-notes">' + escapeHtml(obj.notes) + '</div>' : '')
     );
   } else if (event === 'refined') {

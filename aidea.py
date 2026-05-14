@@ -506,6 +506,178 @@ Risks / what could break: <1-2 sentences naming the most likely failure
 """
 
 
+# ---------------------------------------------------------------------------
+# Einstein Mode: ideas don't appear from thin air. They emerge through four
+# distinct, well-attested mechanisms. Run one synthesis per mechanism so the
+# user can see WHICH route produced their winning idea, not just a temperature
+# variant of the same default route.
+# ---------------------------------------------------------------------------
+
+
+EINSTEIN_PREAMBLE = """\
+The user is working on this problem / question / project:
+
+  {topic}
+
+The four mechanisms below produce ideas in fundamentally different ways.
+This run uses the {mechanism} mechanism. Apply ONLY that mechanism — do
+not slide into any of the others.
+
+Donor concepts (raw material; their role varies by mechanism, see below):
+{seeds}
+
+Hard requirements (apply to every mechanism):
+  - The idea must address the user's stated problem, not a related one.
+  - It must be executable with current technology and resources.
+  - It must be specific enough that the user can identify a first step
+    to try this week.
+"""
+
+
+EINSTEIN_MECHANISMS: dict[str, dict[str, str]] = {
+    "adjacent_possible": {
+        "label": "Adjacent Possible",
+        "blurb": (
+            "Kauffman / Steven Johnson. A field's frontier only steps to "
+            "doors recently unlocked by prior work. Find one such door."
+        ),
+        "instruction": """\
+Process:
+  1. Identify ONE capability that has become widely available in the
+     user's field in the last 1-3 years (a new technique, library,
+     dataset, regulation, piece of hardware, market shift).
+  2. Identify ONE adjacent unmet need that this capability makes
+     newly addressable — something that wasn't viable before.
+  3. Propose the specific step through that door.
+
+Donor cards play a supporting role here: use them to widen your search
+for "what just got unlocked", but do not let them become the focus.
+
+Respond in this exact format, no preamble:
+
+Title: <3-7 memorable words>
+Mechanism: Adjacent Possible
+Recently unlocked: <the specific capability that became viable in the last 1-3 years>
+Adjacent unmet need: <what becomes newly addressable now>
+One-line pitch: <how the user's problem walks through this door>
+How it addresses the request: <2-3 sentences>
+First step the user could take this week: <one concrete action>
+Risks / what could break: <1-2 sentences>
+""",
+    },
+    "exaptation": {
+        "label": "Exaptation",
+        "blurb": (
+            "Gutenberg moved the wine-press mechanism to inked type. Pick a "
+            "mechanism built for something else and re-contextualize it."
+        ),
+        "instruction": """\
+Process:
+  1. Pick exactly ONE donor card from the list — preferably the one whose
+     home domain is FURTHEST from the user's topic.
+  2. Name the structural operating principle that makes it work in its
+     home domain — not the surface description.
+  3. Apply that same operating principle to the user's topic. The
+     transplant is the idea. The remaining donor cards are decoration.
+
+Respond in this exact format, no preamble:
+
+Title: <3-7 memorable words>
+Mechanism: Exaptation
+Borrowed from: <donor card name and its home domain>
+Operating principle being transplanted: <one precise sentence>
+Structural mapping: <2-3 sentences showing how the principle attaches to the topic>
+One-line pitch: <single sentence stating the resulting idea>
+How it addresses the request: <2-3 sentences>
+First step the user could take this week: <one concrete action>
+Risks / what could break: <1-2 sentences>
+""",
+    },
+    "slow_hunch": {
+        "label": "Slow Hunch",
+        "blurb": (
+            "Long-incubated background tensions that haven't been articulated. "
+            "State the unsaid resolution."
+        ),
+        "instruction": """\
+Process:
+  1. Identify ONE tension, contradiction, or half-answered question that
+     practitioners in the user's field have lived with for years but
+     never cleanly resolved. Watch for: two widely-held beliefs that
+     don't square; a workaround everyone uses but no one defends; a
+     pattern that "everyone notices" but no product addresses.
+  2. State the simplest framing that resolves it.
+  3. Propose the project that bets on the resolution being correct.
+
+Donor cards play a background role: use them only if one obviously
+illuminates the tension. Do not force them in.
+
+Respond in this exact format, no preamble:
+
+Title: <3-7 memorable words>
+Mechanism: Slow Hunch
+The latent tension: <what practitioners feel but don't say cleanly>
+Proposed resolution: <the framing that resolves the tension>
+One-line pitch: <single sentence>
+How it addresses the request: <2-3 sentences>
+First step the user could take this week: <one concrete action>
+Risks / what could break: <1-2 sentences — especially: what if the tension is real but the resolution is wrong>
+""",
+    },
+    "productive_error": {
+        "label": "Productive Error",
+        "blurb": (
+            "Penicillin / biological mutation. A misread or inverted assumption "
+            "that turns out to be more useful than the correct one."
+        ),
+        "instruction": """\
+Process:
+  1. Pick ONE assumption practitioners in the user's field take as
+     obviously true. Watch for: "of course", "everyone knows",
+     "naturally we...", "the whole point of X is Y".
+  2. Deliberately invert it, misread it, or take the opposite as true.
+  3. Argue why the misreading is actually the better framing for the
+     user's problem, then propose the project that bets on it.
+
+Donor cards play a background role.
+
+Respond in this exact format, no preamble:
+
+Title: <3-7 memorable words>
+Mechanism: Productive Error
+Assumption being inverted: <the load-bearing belief, as the field states it>
+The misreading: <the deliberately wrong version that turns out useful>
+Why the misreading wins: <2-3 sentences arguing why this framing is better>
+One-line pitch: <single sentence>
+How it addresses the request: <2-3 sentences>
+First step the user could take this week: <one concrete action>
+Risks / what could break: <1-2 sentences>
+""",
+    },
+}
+
+
+def build_einstein_prompt(
+    topic: str,
+    cards: list[Card],
+    mechanism_key: str,
+) -> str:
+    """Build a synthesis prompt locked to one of the four Einstein mechanisms."""
+    if mechanism_key not in EINSTEIN_MECHANISMS:
+        raise ValueError(
+            f"unknown Einstein mechanism {mechanism_key!r}; "
+            f"known: {list(EINSTEIN_MECHANISMS)}"
+        )
+    mech = EINSTEIN_MECHANISMS[mechanism_key]
+    seeds = "\n".join(card.render() for card in cards)
+    preamble = EINSTEIN_PREAMBLE.format(
+        topic=topic.strip(),
+        mechanism=mech["label"],
+        seeds=seeds,
+    )
+    return preamble + "\n" + mech["instruction"]
+
+
 def build_prompt(
     topic: str,
     cards: list[Card],
@@ -825,6 +997,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "call. Best used with --n-ideas 3 or more."
         ),
     )
+    p.add_argument(
+        "--einstein",
+        action="store_true",
+        help=(
+            "Einstein mode: run four mechanism-specific synthesis passes "
+            "instead of n_ideas identical ones — Adjacent Possible, "
+            "Exaptation, Slow Hunch, Productive Error. Each produces one "
+            "idea via a different generative move. Forces n_ideas=4. "
+            "Combine with --refine to pick and harden the strongest mechanism."
+        ),
+    )
     args = p.parse_args(argv)
     if args.n_concepts < 2:
         p.error("--n-concepts must be at least 2 (blending needs >= 2 seeds)")
@@ -902,38 +1085,75 @@ async def run_pipeline(args: argparse.Namespace) -> int:
 
     rng = random.Random(args.seed)
     ideas: list[str] = []
+    mechanisms_used: list[str | None] = []
 
-    for i in range(args.n_ideas):
-        cards = sample_cards(
-            deck=deck,
-            n=args.n_concepts,
-            spread=spread,
-            rng=rng,
-        )
+    if args.einstein:
+        # One pass per mechanism, all sharing the entropy-controlled card draw.
+        mech_keys = list(EINSTEIN_MECHANISMS.keys())
+        total = len(mech_keys)
+        for i, key in enumerate(mech_keys):
+            cards = sample_cards(
+                deck=deck, n=args.n_concepts, spread=spread, rng=rng,
+            )
+            mech = EINSTEIN_MECHANISMS[key]
+            header = (
+                f"\n=== Einstein pass {i + 1}/{total}: {mech['label']} | "
+                f"entropy={level.name} (spread={spread:.2f}) | "
+                f"deck={len(deck)}@{depth.name} | "
+                f"model={args.model} ===\n"
+            )
+            print(header)
+            print(f"Topic: {args.topic.strip()}")
+            print(f"Mechanism: {mech['label']} — {mech['blurb']}")
+            print("Sampled cards:")
+            for c in cards:
+                print(c.render())
+            print()
 
-        header = (
-            f"\n=== Idea {i + 1}/{args.n_ideas} | "
-            f"entropy={level.name} (spread={spread:.2f}) | "
-            f"deck={len(deck)}@{depth.name} | "
-            f"model={args.model} ===\n"
-        )
-        print(header)
-        print(f"Topic: {args.topic.strip()}")
-        print("Sampled cards:")
-        for c in cards:
-            print(c.render())
-        print()
+            prompt = build_einstein_prompt(args.topic, cards, key)
+            idea = await synthesize(
+                prompt=prompt,
+                model=args.model,
+                stream_to_stdout=not args.quiet,
+            )
+            ideas.append(idea)
+            mechanisms_used.append(mech["label"])
 
-        prompt = build_prompt(args.topic, cards, level)
-        idea = await synthesize(
-            prompt=prompt,
-            model=args.model,
-            stream_to_stdout=not args.quiet,
-        )
-        ideas.append(idea)
+            if args.quiet:
+                print(idea)
+    else:
+        for i in range(args.n_ideas):
+            cards = sample_cards(
+                deck=deck,
+                n=args.n_concepts,
+                spread=spread,
+                rng=rng,
+            )
 
-        if args.quiet:
-            print(idea)
+            header = (
+                f"\n=== Idea {i + 1}/{args.n_ideas} | "
+                f"entropy={level.name} (spread={spread:.2f}) | "
+                f"deck={len(deck)}@{depth.name} | "
+                f"model={args.model} ===\n"
+            )
+            print(header)
+            print(f"Topic: {args.topic.strip()}")
+            print("Sampled cards:")
+            for c in cards:
+                print(c.render())
+            print()
+
+            prompt = build_prompt(args.topic, cards, level)
+            idea = await synthesize(
+                prompt=prompt,
+                model=args.model,
+                stream_to_stdout=not args.quiet,
+            )
+            ideas.append(idea)
+            mechanisms_used.append(None)
+
+            if args.quiet:
+                print(idea)
 
     # --- Critic + refine ---------------------------------------------------
     if args.refine and ideas:
@@ -943,16 +1163,27 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             score = await critic_score(args.topic, idea, args.model)
             score["i"] = i
             scored.append(score)
+            tag = (
+                f" [{mechanisms_used[i]}]"
+                if i < len(mechanisms_used) and mechanisms_used[i]
+                else ""
+            )
             print(
-                f"  idea {i + 1}: feasibility={score['feasibility']:>3}  "
+                f"  idea {i + 1}{tag}: "
+                f"feasibility={score['feasibility']:>3}  "
                 f"unexpectedness={score['unexpectedness']:>3}  "
                 f"topic_fit={score['topic_fit']:>3}  "
                 f"total={total_score(score):>3}  — {score['notes']}"
             )
 
         winner = max(scored, key=total_score)
+        winner_mech = (
+            f" [{mechanisms_used[winner['i']]}]"
+            if winner["i"] < len(mechanisms_used) and mechanisms_used[winner["i"]]
+            else ""
+        )
         print(
-            f"\n=== Winner: idea {winner['i'] + 1} "
+            f"\n=== Winner: idea {winner['i'] + 1}{winner_mech} "
             f"(total {total_score(winner)}) — refining at low entropy ===\n"
         )
         refined = await refine_idea(
