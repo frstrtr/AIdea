@@ -636,26 +636,6 @@ async def generate_deck(
     cards = _parse_jsonl_cards(text, depth)
     if verbose:
         print(f"[deck] parsed {len(cards)} cards", flush=True)
-
-    # Ingest into per-source corpus for future runs to retrieve from.
-    try:
-        from rag import ingest_deck
-        from transcripts import current_source
-        from usage import current_run_id
-        n_ingested = ingest_deck(
-            source=current_source() or "unknown",
-            run_id=current_run_id() or "unknown",
-            topic=topic,
-            cards=cards,
-            mode="default",  # mode at deck-gen is "default"; idea-time mode varies
-        )
-        if verbose and n_ingested:
-            print(
-                f"[deck] ingested {n_ingested} card(s) into RAG corpus",
-                flush=True,
-            )
-    except Exception:
-        pass
     return cards
 
 
@@ -674,21 +654,45 @@ async def load_or_generate_deck(
         if verbose:
             print(f"[deck] using cached deck at {path}", flush=True)
         data = json.loads(path.read_text())
-        return [Card(**c) for c in data]
-    cards = await generate_deck(
-        topic, n, depth, model, verbose,
-        theme_entropy=theme_entropy, themes=themes,
-    )
-    if not cards:
-        raise RuntimeError(
-            "Deck generation produced no parseable cards. "
-            "Try a different model or --regen-deck."
+        cards = [Card(**c) for c in data]
+    else:
+        cards = await generate_deck(
+            topic, n, depth, model, verbose,
+            theme_entropy=theme_entropy, themes=themes,
         )
-    path.write_text(
-        json.dumps([c.__dict__ for c in cards], indent=2, ensure_ascii=False)
-    )
-    if verbose:
-        print(f"[deck] cached {len(cards)} cards to {path}", flush=True)
+        if not cards:
+            raise RuntimeError(
+                "Deck generation produced no parseable cards. "
+                "Try a different model or --regen-deck."
+            )
+        path.write_text(
+            json.dumps([c.__dict__ for c in cards], indent=2, ensure_ascii=False)
+        )
+        if verbose:
+            print(f"[deck] cached {len(cards)} cards to {path}", flush=True)
+
+    # Ingest into the per-source corpus on every pipeline run, including
+    # cache hits — the deck cache is keyed by topic/depth/model and is
+    # source-agnostic, so a new source reusing a cached deck still needs
+    # the (source, run_id) link recorded for tenant-isolated retrieval.
+    try:
+        from rag import ingest_deck
+        from transcripts import current_source
+        from usage import current_run_id
+        n_ingested = ingest_deck(
+            source=current_source() or "unknown",
+            run_id=current_run_id() or "unknown",
+            topic=topic,
+            cards=cards,
+            mode="default",
+        )
+        if verbose and n_ingested:
+            print(
+                f"[deck] ingested {n_ingested} card(s) into RAG corpus",
+                flush=True,
+            )
+    except Exception:
+        pass
     return cards
 
 
