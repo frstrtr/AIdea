@@ -678,6 +678,92 @@ def build_einstein_prompt(
     return preamble + "\n" + mech["instruction"]
 
 
+# ---------------------------------------------------------------------------
+# LSD / Prior-Dissolution mode. Predictive-processing framing: perception is
+# a controlled hallucination — the brain runs a model and constructs
+# "reality" from priors plus minimal sensory data (Friston, Seth, REBUS).
+# Fields work the same way: the way practitioners perceive their problem is
+# a construct, not a direct view. This mode loosens the interpretive prior
+# instead of inverting a single belief.
+# ---------------------------------------------------------------------------
+
+
+LSD_LABEL = "Prior Dissolution"
+
+LSD_PROMPT_TEMPLATE = """\
+The user is working on this problem / question / project:
+
+  {topic}
+
+This synthesis uses PRIOR DISSOLUTION. Predictive-processing neuroscience
+(Friston, Seth, Carhart-Harris's REBUS framing of psychedelics) treats
+perception as a controlled hallucination: the brain runs a generative
+model and constructs "reality" from high-level priors plus minimal
+sensory data. Practitioners in any field do the same thing — the way
+they perceive their problem is a learned interpretive frame, not a
+direct view of the situation. Psychedelics interest neuroscientists
+because they relax those high-level priors and let the same raw input
+be re-organized under a different category.
+
+Your job is to suspend the field's interpretive frame and re-organize
+the same underlying situation under a different category. This is NOT:
+
+  - inverting a single assumption (that's Productive Error)
+  - borrowing a mechanism from another field (that's Exaptation)
+  - stepping forward through a recently-unlocked door (that's Adjacent
+    Possible)
+
+It is dissolving the silent category the field uses to perceive the
+problem at all, and seeing what becomes obvious without that prior.
+
+Donor concepts (raw material; some may resonate, most will not — that
+is expected):
+{seeds}
+
+Process:
+1. Name ONE load-bearing prior the field uses to perceive this problem.
+   A prior is the silent, almost-invisible category-membership the field
+   assigns the problem. Examples in other domains:
+     - "Email is messages between inboxes" (prior: communication is
+       atomic, addressed, durable).
+     - "A car is for getting from A to B" (prior: cars are tools, not
+       experiences).
+     - "Education is content delivery" (prior: knowledge moves from
+       teacher to student).
+   Pick the prior NO ONE in the user's field would think to question.
+
+2. Dissolve it. Suspend the category and look at the same raw situation
+   without that frame installed.
+
+3. Re-perceive. The same situation, re-categorized, often makes the
+   problem dissolve, become trivial, or reveal a completely different
+   project. Your idea is what becomes obvious AFTER the prior is gone.
+
+Hard requirements:
+  - The idea must address the user's stated problem, OR show why under
+    the new frame the "problem" disappears (that is a valid output).
+  - It must be executable with technology and resources available today.
+  - It must be specific enough that the user can identify a first step.
+
+Respond in EXACTLY this format, no preamble, no closing remarks:
+
+Title: <3-7 memorable words>
+Mechanism: Prior Dissolution
+The prior being dissolved: <the silent interpretive frame the field uses>
+What the same situation becomes without that prior: <2-3 sentences re-categorizing the situation>
+One-line pitch: <how the idea follows naturally from the new frame>
+How it addresses the request: <2-3 sentences>
+Mechanism (technical): <2-3 sentences on how the re-organization actually works in practice>
+First step the user could take this week: <one concrete action>
+Risks / what could break: <1-2 sentences — especially: what if the original prior was load-bearing for a reason no one ever wrote down>
+"""
+
+
+def build_lsd_prompt(topic: str, cards: list[Card]) -> str:
+    seeds = "\n".join(card.render() for card in cards)
+    return LSD_PROMPT_TEMPLATE.format(topic=topic.strip(), seeds=seeds)
+
+
 def build_prompt(
     topic: str,
     cards: list[Card],
@@ -1008,6 +1094,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Combine with --refine to pick and harden the strongest mechanism."
         ),
     )
+    p.add_argument(
+        "--lsd",
+        action="store_true",
+        help=(
+            "LSD mode (a.k.a. Prior Dissolution): predictive-processing "
+            "framing — perception is a controlled hallucination, so loosen "
+            "the field's interpretive prior and re-perceive the same "
+            "situation under a different category. Each pass dissolves one "
+            "load-bearing prior. Mutually exclusive with --einstein."
+        ),
+    )
     args = p.parse_args(argv)
     if args.n_concepts < 2:
         p.error("--n-concepts must be at least 2 (blending needs >= 2 seeds)")
@@ -1083,11 +1180,52 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             print(c.render())
         print()
 
+    if args.einstein and args.lsd:
+        print(
+            "error: --einstein and --lsd are mutually exclusive. Pick one.",
+            file=sys.stderr,
+        )
+        return 2
+
     rng = random.Random(args.seed)
     ideas: list[str] = []
     mechanisms_used: list[str | None] = []
 
-    if args.einstein:
+    if args.lsd:
+        # n_ideas passes, each dissolving one (model's-choice) load-bearing prior.
+        for i in range(args.n_ideas):
+            cards = sample_cards(
+                deck=deck, n=args.n_concepts, spread=spread, rng=rng,
+            )
+            header = (
+                f"\n=== LSD pass {i + 1}/{args.n_ideas}: Prior Dissolution | "
+                f"entropy={level.name} (spread={spread:.2f}) | "
+                f"deck={len(deck)}@{depth.name} | "
+                f"model={args.model} ===\n"
+            )
+            print(header)
+            print(f"Topic: {args.topic.strip()}")
+            print(
+                "Mechanism: Prior Dissolution — loosen the field's "
+                "interpretive prior and re-perceive."
+            )
+            print("Sampled cards:")
+            for c in cards:
+                print(c.render())
+            print()
+
+            prompt = build_lsd_prompt(args.topic, cards)
+            idea = await synthesize(
+                prompt=prompt,
+                model=args.model,
+                stream_to_stdout=not args.quiet,
+            )
+            ideas.append(idea)
+            mechanisms_used.append(LSD_LABEL)
+
+            if args.quiet:
+                print(idea)
+    elif args.einstein:
         # One pass per mechanism, all sharing the entropy-controlled card draw.
         mech_keys = list(EINSTEIN_MECHANISMS.keys())
         total = len(mech_keys)

@@ -26,8 +26,10 @@ from aidea import (
     CARD_DEPTHS,
     EINSTEIN_MECHANISMS,
     ENTROPY_LEVELS,
+    LSD_LABEL,
     Card,
     build_einstein_prompt,
+    build_lsd_prompt,
     build_prompt,
     cards_from_static_bank,
     critic_score,
@@ -60,6 +62,7 @@ class GenerateRequest(BaseModel):
     bank_data: dict[str, list[str]] | None = None  # inline static bank
     refine: bool = False  # score ideas + refine the winner at low entropy
     einstein: bool = False  # four mechanism-specific passes instead of n_ideas
+    lsd: bool = False  # prior-dissolution passes (mutually exclusive with einstein)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +109,12 @@ def _card_to_dict(c: Card) -> dict:
 
 
 async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
+    if req.einstein and req.lsd:
+        yield _sse("error", {
+            "message": "einstein and lsd modes are mutually exclusive; pick one.",
+        })
+        return
+
     try:
         spread, level = parse_entropy(req.entropy)
     except SystemExit as e:
@@ -183,13 +192,22 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
 
     if req.einstein:
         passes = [
-            (key, mech["label"], mech["blurb"])
+            (("einstein", key), mech["label"], mech["blurb"])
             for key, mech in EINSTEIN_MECHANISMS.items()
         ]
+    elif req.lsd:
+        lsd_blurb = (
+            "Predictive processing: perception is constructed from priors. "
+            "Loosen the field's interpretive prior and re-perceive."
+        )
+        passes = [
+            (("lsd", None), LSD_LABEL, lsd_blurb)
+            for _ in range(req.n_ideas)
+        ]
     else:
-        passes = [(None, None, None) for _ in range(req.n_ideas)]
+        passes = [((None, None), None, None) for _ in range(req.n_ideas)]
 
-    for i, (mech_key, mech_label, mech_blurb) in enumerate(passes):
+    for i, ((mode, mech_key), mech_label, mech_blurb) in enumerate(passes):
         cards = sample_cards(deck=deck, n=req.n_concepts, spread=spread, rng=rng)
         yield _sse("sample", {
             "i": i,
@@ -213,8 +231,10 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             "message": synth_msg,
         })
 
-        if mech_key is not None:
+        if mode == "einstein":
             prompt = build_einstein_prompt(req.topic, cards, mech_key)
+        elif mode == "lsd":
+            prompt = build_lsd_prompt(req.topic, cards)
         else:
             prompt = build_prompt(req.topic, cards, level)
 
@@ -433,6 +453,10 @@ INDEX_HTML = r"""<!doctype html>
               background: #2c3e75; color: #fff; border-radius: 999px;
               font-size: 0.7rem; letter-spacing: 0.04em; text-transform: uppercase;
               font-weight: 600; }
+  .mech-tag.lsd {
+    background: linear-gradient(90deg, #6a2c75, #c9396a, #f0a544);
+    color: #fff; text-shadow: 0 0 4px rgba(0,0,0,0.4);
+  }
   .mech-blurb { color: #666; font-size: 0.85rem; font-style: italic;
                 margin: 0.15rem 0 0.45rem; }
   .error { color: #b00020; border-left-color: #b00020; }
@@ -533,6 +557,11 @@ INDEX_HTML = r"""<!doctype html>
     Einstein mode — four mechanisms (Adjacent Possible · Exaptation · Slow Hunch · Productive Error). Overrides n_ideas to 4.
   </label>
 
+  <label class="inline">
+    <input type="checkbox" name="lsd">
+    LSD mode — Prior Dissolution. Loosen the field's interpretive prior and re-perceive (Friston / Seth / REBUS). Uses n_ideas.
+  </label>
+
   <details class="advanced">
     <summary>Bring your own deck (optional)</summary>
     <label>
@@ -561,11 +590,16 @@ form.addEventListener('submit', async (e) => {
   for (const k of Object.keys(startByPhase)) delete startByPhase[k];
 
   const fd = new FormData(form);
+  if (fd.get('einstein') && fd.get('lsd')) {
+    addPanel('<div class="error">Einstein mode and LSD mode are mutually ' +
+             'exclusive. Pick one.</div>');
+    return;
+  }
   const payload = {};
   for (const [k, v] of fd.entries()) {
     if (v === '') continue;
     if (['cards','n_concepts','n_ideas','seed'].includes(k)) payload[k] = Number(v);
-    else if (k === 'regen_deck' || k === 'refine' || k === 'einstein') payload[k] = true;
+    else if (k === 'regen_deck' || k === 'refine' || k === 'einstein' || k === 'lsd') payload[k] = true;
     else if (k === 'bank_data') {
       try {
         payload.bank_data = JSON.parse(v);
@@ -646,7 +680,7 @@ function handleEvent(chunk) {
   } else if (event === 'sample') {
     const cardHtml = obj.cards.map(renderCard).join('');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     const blurb = obj.mechanism_blurb
       ? '<div class="mech-blurb">' + escapeHtml(obj.mechanism_blurb) + '</div>'
@@ -662,7 +696,7 @@ function handleEvent(chunk) {
   } else if (event === 'idea') {
     finishStatus('synth-' + obj.i, 'idea ' + (obj.i + 1) + ' ready');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     addPanel(
       '<div class="meta">Idea ' + (obj.i + 1) + mechTag + '</div>' +
@@ -672,7 +706,7 @@ function handleEvent(chunk) {
     finishStatus('critic-' + obj.i,
                  'idea ' + (obj.i + 1) + ' scored ' + obj.total + '/300');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     addPanel(
       '<div class="meta">Score · idea ' + (obj.i + 1) + mechTag + '</div>' +
