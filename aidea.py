@@ -528,6 +528,23 @@ SYNTHESIZER_SYSTEM = (
 )
 
 
+async def _query_text(prompt: str, system: str, model: str) -> str:
+    """One-shot inference call returning concatenated text."""
+    options = ClaudeAgentOptions(
+        model=model,
+        system_prompt=system,
+        max_turns=1,
+        allowed_tools=[],
+    )
+    chunks: list[str] = []
+    async for message in query(prompt=prompt, options=options):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    chunks.append(block.text)
+    return "".join(chunks)
+
+
 async def synthesize(
     prompt: str,
     model: str,
@@ -553,6 +570,132 @@ async def synthesize(
     if stream_to_stdout:
         print()
     return "".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Critic + Refinement: score ideas, then harden the winner at low entropy.
+# ---------------------------------------------------------------------------
+
+
+CRITIC_SYSTEM = (
+    "You are a critic for an applied-ideas synthesizer. You score a single "
+    "idea against a user problem on three axes. Output STRICT JSON only — "
+    "one object, no surrounding code fences, no preamble, no commentary."
+)
+
+
+CRITIC_PROMPT_TEMPLATE = """\
+The user is working on this problem:
+
+  {topic}
+
+Score this idea on three axes from 0 to 100. Be honest — your job is to
+differentiate good ideas from filler, so use the full range. Reserve 90+
+for genuinely strong, reserve 0-20 for clearly weak; cluster the middle.
+
+  - feasibility: can a small team execute this with current technology in
+    the user's stated field within months? 100 = obviously yes, 0 = science
+    fiction.
+  - unexpectedness: how non-obvious is the structural choice? 100 = "I did
+    not see that coming"; 0 = "I would have thought of this in 30 seconds".
+  - topic_fit: does this address the user's stated problem (vs a tangent)?
+    100 = bullseye; 0 = answers a different question.
+
+Idea to score:
+
+{idea}
+
+Respond as ONE JSON object only, with these keys exactly:
+  {{"feasibility": <int 0-100>, "unexpectedness": <int 0-100>,
+    "topic_fit": <int 0-100>, "notes": "<one sentence — what's strongest,
+    what's weakest>"}}
+"""
+
+
+def _try_parse_json_object(raw: str) -> dict | None:
+    """Tolerantly extract the first JSON object from a model response."""
+    s = raw.strip()
+    # Strip leading/trailing code fences if present.
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\n?|\n?```$", "", s).strip()
+    # Greedy from the first { to the last } in the string.
+    a, b = s.find("{"), s.rfind("}")
+    if a == -1 or b == -1 or b < a:
+        return None
+    try:
+        obj = json.loads(s[a : b + 1])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+async def critic_score(topic: str, idea: str, model: str) -> dict:
+    """Return {feasibility, unexpectedness, topic_fit, notes} (ints clipped 0-100)."""
+    prompt = CRITIC_PROMPT_TEMPLATE.format(topic=topic.strip(), idea=idea.strip())
+    raw = await _query_text(prompt, CRITIC_SYSTEM, model)
+    obj = _try_parse_json_object(raw) or {}
+
+    def _clip(v: object) -> int:
+        try:
+            return max(0, min(100, int(float(v))))
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "feasibility": _clip(obj.get("feasibility")),
+        "unexpectedness": _clip(obj.get("unexpectedness")),
+        "topic_fit": _clip(obj.get("topic_fit")),
+        "notes": str(obj.get("notes", "")).strip()[:500],
+    }
+
+
+def total_score(score: dict) -> int:
+    return (
+        score.get("feasibility", 0)
+        + score.get("unexpectedness", 0)
+        + score.get("topic_fit", 0)
+    )
+
+
+REFINE_PROMPT_TEMPLATE = """\
+The user is working on this problem:
+
+  {topic}
+
+Below is a candidate idea that scored highest in a previous pass. The
+critic's note: "{notes}"
+
+Your job now is to HARDEN it. Keep the core structural mechanism — do not
+swap it for a different one. Instead:
+
+  - Make the "First step the user could take this week" radically more
+    concrete: name specific tools, file formats, command names, data
+    sources, or vendors a single person could touch on day one.
+  - Take the named risk seriously: state the specific mitigation in the
+    Risks line, not just "we'd have to be careful".
+  - Tighten the one-line pitch so a smart stranger gets it in one read.
+  - Do not change the title unless the original is genuinely misleading.
+
+Original idea:
+
+{idea}
+
+Respond in EXACTLY the same format the synthesizer uses (Title,
+One-line pitch, How it addresses the request, Mechanism, Why it's
+unexpected, First step the user could take this week, Risks). No preamble,
+no closing remarks.
+"""
+
+
+async def refine_idea(
+    topic: str, idea: str, notes: str, model: str,
+) -> str:
+    prompt = REFINE_PROMPT_TEMPLATE.format(
+        topic=topic.strip(),
+        idea=idea.strip(),
+        notes=notes.strip() or "no specific critique provided",
+    )
+    return await _query_text(prompt, SYNTHESIZER_SYSTEM, model)
 
 
 def load_bank(path: str | None) -> dict[str, list[str]]:
@@ -673,6 +816,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Don't stream the model's output; only print the final idea.",
     )
+    p.add_argument(
+        "--refine",
+        action="store_true",
+        help=(
+            "After generating all ideas, score each and refine the winner at "
+            "low entropy ('sane'). Adds 1 critic call per idea + 1 refinement "
+            "call. Best used with --n-ideas 3 or more."
+        ),
+    )
     args = p.parse_args(argv)
     if args.n_concepts < 2:
         p.error("--n-concepts must be at least 2 (blending needs >= 2 seeds)")
@@ -749,6 +901,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         print()
 
     rng = random.Random(args.seed)
+    ideas: list[str] = []
 
     for i in range(args.n_ideas):
         cards = sample_cards(
@@ -777,9 +930,38 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             model=args.model,
             stream_to_stdout=not args.quiet,
         )
+        ideas.append(idea)
 
         if args.quiet:
             print(idea)
+
+    # --- Critic + refine ---------------------------------------------------
+    if args.refine and ideas:
+        print(f"\n=== Critic pass ({len(ideas)} ideas) ===")
+        scored: list[dict] = []
+        for i, idea in enumerate(ideas):
+            score = await critic_score(args.topic, idea, args.model)
+            score["i"] = i
+            scored.append(score)
+            print(
+                f"  idea {i + 1}: feasibility={score['feasibility']:>3}  "
+                f"unexpectedness={score['unexpectedness']:>3}  "
+                f"topic_fit={score['topic_fit']:>3}  "
+                f"total={total_score(score):>3}  — {score['notes']}"
+            )
+
+        winner = max(scored, key=total_score)
+        print(
+            f"\n=== Winner: idea {winner['i'] + 1} "
+            f"(total {total_score(winner)}) — refining at low entropy ===\n"
+        )
+        refined = await refine_idea(
+            topic=args.topic,
+            idea=ideas[winner["i"]],
+            notes=winner.get("notes", ""),
+            model=args.model,
+        )
+        print(refined)
 
     return 0
 

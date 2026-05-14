@@ -28,11 +28,14 @@ from aidea import (
     Card,
     build_prompt,
     cards_from_static_bank,
+    critic_score,
     load_bank,
     load_or_generate_deck,
     parse_entropy,
+    refine_idea,
     sample_cards,
     synthesize,
+    total_score,
 )
 
 
@@ -52,6 +55,8 @@ class GenerateRequest(BaseModel):
     model: str = "claude-opus-4-7"
     regen_deck: bool = False
     bank: str | None = None  # path to static JSON bank; bypasses deck-gen
+    bank_data: dict[str, list[str]] | None = None  # inline static bank
+    refine: bool = False  # score ideas + refine the winner at low entropy
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +115,17 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
     depth = CARD_DEPTH_BY_NAME[req.card_depth]
 
     # --- Stage 0: deck -----------------------------------------------------
-    if req.bank:
+    if req.bank_data is not None:
+        yield _sse("status", {
+            "phase": "deck",
+            "message": "Loading user-supplied inline bank",
+        })
+        try:
+            deck = cards_from_static_bank(req.bank_data)
+        except Exception as e:
+            yield _sse("error", {"message": f"inline bank invalid: {e}"})
+            return
+    elif req.bank:
         yield _sse("status", {
             "phase": "deck",
             "message": f"Loading static bank: {req.bank}",
@@ -160,6 +175,7 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
 
     # --- Stage 1 & 2: sample + synthesize, per idea -----------------------
     rng = random.Random(req.seed)
+    ideas: list[str] = []
     for i in range(req.n_ideas):
         cards = sample_cards(deck=deck, n=req.n_concepts, spread=spread, rng=rng)
         yield _sse("sample", {
@@ -193,6 +209,73 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         assert idea is not None
 
         yield _sse("idea", {"i": i, "text": idea})
+        ideas.append(idea)
+
+    # --- Stage 3: critic + refinement (optional) --------------------------
+    if req.refine and ideas:
+        yield _sse("status", {
+            "phase": "critic",
+            "message": (
+                f"Scoring {len(ideas)} idea(s) on feasibility / "
+                f"unexpectedness / topic fit..."
+            ),
+        })
+        scored: list[dict] = []
+        for i, idea in enumerate(ideas):
+            score: dict | None = None
+            try:
+                async for kind, payload in _watched(
+                    critic_score(req.topic, idea, req.model),
+                    phase=f"critic-{i}",
+                ):
+                    if kind == "progress":
+                        yield _sse("progress", payload)
+                    else:
+                        score = payload
+            except Exception as e:
+                yield _sse("error", {"message": f"critic failed: {e}"})
+                return
+            assert score is not None
+            score["i"] = i
+            score["total"] = total_score(score)
+            scored.append(score)
+            yield _sse("score", score)
+
+        winner = max(scored, key=lambda s: s["total"])
+        yield _sse("winner", {
+            "i": winner["i"],
+            "total": winner["total"],
+            "notes": winner.get("notes", ""),
+        })
+
+        yield _sse("status", {
+            "phase": "refine",
+            "message": (
+                f"Refining idea {winner['i'] + 1} at low entropy "
+                "to harden the first-step and risks..."
+            ),
+        })
+        refined: str | None = None
+        try:
+            async for kind, payload in _watched(
+                refine_idea(
+                    topic=req.topic,
+                    idea=ideas[winner["i"]],
+                    notes=winner.get("notes", ""),
+                    model=req.model,
+                ),
+                phase="refine",
+            ):
+                if kind == "progress":
+                    yield _sse("progress", payload)
+                else:
+                    refined = payload
+        except Exception as e:
+            yield _sse("error", {"message": f"refine failed: {e}"})
+            return
+        assert refined is not None
+
+        yield _sse("refined", {"i": winner["i"], "text": refined})
 
     yield _sse("done", {})
 
@@ -309,14 +392,34 @@ INDEX_HTML = r"""<!doctype html>
     font-size: 0.92rem; margin: 0;
   }
   .meta { color: #777; font-size: 0.8rem; margin-bottom: 0.3rem; }
+  .meta.refined-meta { color: #1a8a4f; font-weight: 600; letter-spacing: 0.05em;
+                       text-transform: uppercase; }
   .error { color: #b00020; border-left-color: #b00020; }
+  .score-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.2rem 0 0.4rem; }
+  .score-pill { background: #eee; color: #333; border-radius: 999px;
+                padding: 0.15rem 0.6rem; font-size: 0.82rem;
+                font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .score-pill.total { background: #1a1a1a; color: #fff; }
+  .critic-notes { color: #555; font-size: 0.88rem; font-style: italic;
+                  margin-top: 0.2rem; }
+  .winner-banner { background: #fff8c2; border-left: 3px solid #b59500;
+                   padding: 0.45rem 0.7rem; font-weight: 600;
+                   font-size: 0.95rem; border-radius: 0 4px 4px 0; }
+  .idea.refined { border-left-width: 4px; border-left-color: #1a8a4f;
+                  background: #f4faf6; }
   @media (prefers-color-scheme: dark) {
     body { color: #e5e5e5; }
     input, select, textarea { background: #1e1e1e; border-color: #444; color: #e5e5e5; }
     button { background: #e5e5e5; color: #1a1a1a; }
     .panel { background: #1a1a1a; border-color: #333; }
     .idea { background: #111; border-left-color: #e5e5e5; }
-    .sub, .status, summary, .card .domain { color: #aaa; }
+    .idea.refined { background: #0f1a13; border-left-color: #3acb78; }
+    .meta.refined-meta { color: #3acb78; }
+    .sub, .status, summary, .card .domain, .critic-notes { color: #aaa; }
+    .score-pill { background: #2a2a2a; color: #ddd; }
+    .score-pill.total { background: #e5e5e5; color: #1a1a1a; }
+    .winner-banner { background: #1a1a0a; border-left-color: #b59500;
+                     color: #f0e0a0; }
   }
 </style>
 </head>
@@ -379,6 +482,21 @@ INDEX_HTML = r"""<!doctype html>
     Force regenerate deck (otherwise use cache if present)
   </label>
 
+  <label class="inline">
+    <input type="checkbox" name="refine">
+    Critic + refine winner (extra calls: 1 score per idea, 1 refinement)
+  </label>
+
+  <details class="advanced">
+    <summary>Bring your own deck (optional)</summary>
+    <label>
+      Inline donor bank as JSON — <code>{"domain": ["concept", ...], ...}</code>.
+      Replaces topic-aware deck generation. Shallow depth (no mechanism field).
+      <textarea name="bank_data" rows="4"
+        placeholder='{"my-field": ["concept1", "concept2"], "adjacent": ["..."]}'></textarea>
+    </label>
+  </details>
+
   <button id="submit" type="submit">Generate</button>
 </form>
 
@@ -391,19 +509,29 @@ const btn = document.getElementById('submit');
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
+
+  out.innerHTML = '';
+  for (const k of Object.keys(statusByPhase)) delete statusByPhase[k];
+  for (const k of Object.keys(startByPhase)) delete startByPhase[k];
+
   const fd = new FormData(form);
   const payload = {};
   for (const [k, v] of fd.entries()) {
     if (v === '') continue;
     if (['cards','n_concepts','n_ideas','seed'].includes(k)) payload[k] = Number(v);
-    else if (k === 'regen_deck') payload[k] = true;
-    else payload[k] = v;
+    else if (k === 'regen_deck' || k === 'refine') payload[k] = true;
+    else if (k === 'bank_data') {
+      try {
+        payload.bank_data = JSON.parse(v);
+      } catch (err) {
+        addPanel('<div class="error">bank_data is not valid JSON: ' +
+                 escapeHtml(err.message) + '</div>');
+        return;
+      }
+    } else payload[k] = v;
   }
   if (!('regen_deck' in payload)) payload.regen_deck = false;
-
-  out.innerHTML = '';
-  for (const k of Object.keys(statusByPhase)) delete statusByPhase[k];
-  for (const k of Object.keys(startByPhase)) delete startByPhase[k];
+  if (!('refine' in payload)) payload.refine = false;
   btn.disabled = true;
   btn.textContent = 'Generating…';
   try {
@@ -482,6 +610,32 @@ function handleEvent(chunk) {
     addPanel(
       '<div class="meta">Idea ' + (obj.i + 1) + '</div>' +
       '<div class="idea"><pre>' + escapeHtml(obj.text) + '</pre></div>'
+    );
+  } else if (event === 'score') {
+    finishStatus('critic-' + obj.i,
+                 'idea ' + (obj.i + 1) + ' scored ' + obj.total + '/300');
+    addPanel(
+      '<div class="meta">Score · idea ' + (obj.i + 1) + '</div>' +
+      '<div class="score-row">' +
+        '<span class="score-pill">feasibility ' + obj.feasibility + '</span>' +
+        '<span class="score-pill">unexpectedness ' + obj.unexpectedness + '</span>' +
+        '<span class="score-pill">topic-fit ' + obj.topic_fit + '</span>' +
+        '<span class="score-pill total">total ' + obj.total + '/300</span>' +
+      '</div>' +
+      (obj.notes ? '<div class="critic-notes">' + escapeHtml(obj.notes) + '</div>' : '')
+    );
+  } else if (event === 'winner') {
+    addPanel(
+      '<div class="meta">Winner</div>' +
+      '<div class="winner-banner">Idea ' + (obj.i + 1) +
+      ' wins with ' + obj.total + '/300</div>' +
+      (obj.notes ? '<div class="critic-notes">' + escapeHtml(obj.notes) + '</div>' : '')
+    );
+  } else if (event === 'refined') {
+    finishStatus('refine', 'refined idea ' + (obj.i + 1));
+    addPanel(
+      '<div class="meta refined-meta">Refined · idea ' + (obj.i + 1) + '</div>' +
+      '<div class="idea refined"><pre>' + escapeHtml(obj.text) + '</pre></div>'
     );
   } else if (event === 'done') {
     addPanel('<div class="status done"><span class="dot"></span>' +
