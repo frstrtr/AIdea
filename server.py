@@ -31,15 +31,19 @@ from pydantic import BaseModel, Field
 from aidea import (
     CARD_DEPTH_BY_NAME,
     CARD_DEPTHS,
+    DREAM_LABEL,
     EINSTEIN_MECHANISMS,
     ENTROPY_LEVELS,
     FUTURES_HORIZONS,
     FUTURES_HORIZONS_BY_KEY,
     LSD_LABEL,
+    LUCID_LABEL,
     Card,
+    build_dream_prompt,
     build_einstein_prompt,
     build_futures_prompt,
     build_lsd_prompt,
+    build_lucid_prompt,
     build_prompt,
     cards_from_static_bank,
     critic_score,
@@ -77,6 +81,10 @@ class GenerateRequest(BaseModel):
     einstein: bool = False  # four mechanism-specific passes instead of n_ideas
     lsd: bool = False  # prior-dissolution passes (mutually exclusive with einstein)
     futures: bool = False  # four temporal-horizon passes (mut. excl. w/ einstein/lsd)
+    dream: bool = False  # dreaming mode: feasibility-off, dream-image output
+    lucid: str | None = None  # lucid mode: directional prior the dream biases toward
+    themes: list[str] | None = None  # explicit theme override for deck-gen
+    theme_entropy: float | None = None  # 0..1; defaults to spread of entropy field
     evolve_deck: bool = False  # rewrite winning cards back into the deck cache
 
 
@@ -134,6 +142,8 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         "einstein" if req.einstein else
         "lsd" if req.lsd else
         "futures" if req.futures else
+        "dream" if req.dream else
+        "lucid" if req.lucid else
         "default"
     )
     transcript_log(
@@ -147,12 +157,14 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         regen_deck=bool(req.regen_deck),
     )
 
-    modes_on = sum(1 for f in (req.einstein, req.lsd, req.futures) if f)
+    modes_on = sum(
+        1 for f in (req.einstein, req.lsd, req.futures, req.dream, bool(req.lucid)) if f
+    )
     if modes_on > 1:
         yield _sse("error", {
             "message": (
-                "einstein, lsd, and futures modes are mutually exclusive; "
-                "pick at most one."
+                "einstein / lsd / futures / dream / lucid modes are "
+                "mutually exclusive; pick at most one."
             ),
         })
         return
@@ -210,6 +222,11 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             ),
         })
         deck = None
+        _theme_entropy = (
+            req.theme_entropy
+            if req.theme_entropy is not None
+            else spread
+        )
         try:
             async for kind, payload in _watched(
                 load_or_generate_deck(
@@ -219,6 +236,8 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
                     model=req.model,
                     force_regen=req.regen_deck,
                     verbose=False,
+                    theme_entropy=_theme_entropy,
+                    themes=req.themes,
                 ),
                 phase="deck",
             ):
@@ -253,6 +272,25 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         passes = [
             (("einstein", key), mech["label"], mech["blurb"])
             for key, mech in EINSTEIN_MECHANISMS.items()
+        ]
+    elif req.dream:
+        dream_blurb = (
+            "Dreaming: prediction-error offline. Generative model runs "
+            "free, no feasibility constraint. Output is a dream image + "
+            "what survives waking."
+        )
+        passes = [
+            (("dream", None), DREAM_LABEL, dream_blurb)
+            for _ in range(req.n_ideas)
+        ]
+    elif req.lucid:
+        lucid_blurb = (
+            "Lucid Dreaming: relaxed feasibility + a directional prior "
+            "the dream biases toward, with one reality check."
+        )
+        passes = [
+            (("lucid", req.lucid), LUCID_LABEL, lucid_blurb)
+            for _ in range(req.n_ideas)
         ]
     elif req.lsd:
         lsd_blurb = (
@@ -301,6 +339,10 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             prompt = build_lsd_prompt(req.topic, cards)
         elif mode == "futures":
             prompt = build_futures_prompt(req.topic, cards, mech_key)
+        elif mode == "dream":
+            prompt = build_dream_prompt(req.topic, cards)
+        elif mode == "lucid":
+            prompt = build_lucid_prompt(req.topic, cards, mech_key or "")
         else:
             prompt = build_prompt(req.topic, cards, level)
 
@@ -615,6 +657,14 @@ INDEX_HTML = r"""<!doctype html>
     background: linear-gradient(90deg, #1e6b6b, #2e8c63, #b59500);
     color: #fff; text-shadow: 0 0 4px rgba(0,0,0,0.4);
   }
+  .mech-tag.dream {
+    background: linear-gradient(90deg, #102050, #43306e, #6b3ea3);
+    color: #fff; text-shadow: 0 0 4px rgba(0,0,0,0.5);
+  }
+  .mech-tag.lucid {
+    background: linear-gradient(90deg, #4a2a8c, #8c3aa6, #d36ab9);
+    color: #fff; text-shadow: 0 0 4px rgba(0,0,0,0.4);
+  }
   .mech-blurb { color: #666; font-size: 0.85rem; font-style: italic;
                 margin: 0.15rem 0 0.45rem; }
   .panel.usage { position: sticky; bottom: 0.6rem; margin-top: 1.2rem;
@@ -695,8 +745,23 @@ INDEX_HTML = r"""<!doctype html>
   Inference-driven entropy idea generator. Three orthogonal knobs:
   <b>deck size</b> (raw material pool), <b>card depth</b> (pre-seeded detail),
   <b>entropy</b> (how cross-domain the shuffle and how far the synthesis may
-  depart from current practice). Feasibility is enforced at every level.
+  depart from current practice). Feasibility is enforced at every level
+  except Dream / Lucid.
 </p>
+
+<details class="modes-legend">
+  <summary>Modes — pick at most one</summary>
+  <table>
+    <tr><th>Mode</th><th>What it does</th></tr>
+    <tr><td><code>default</code></td><td>Generate <code>n_ideas</code> ideas at the requested entropy. Standard applied-ideas pass with feasibility-required output.</td></tr>
+    <tr><td><code>Einstein</code></td><td>Four passes, one per mechanism: <b>Adjacent Possible</b> (next door unlocked) · <b>Exaptation</b> (transplant a mechanism from another field) · <b>Slow Hunch</b> (latent tension resolved) · <b>Productive Error</b> (invert a load-bearing assumption).</td></tr>
+    <tr><td><code>LSD</code></td><td><b>Prior Dissolution</b> — predictive-processing framing. Suspend the field's interpretive prior and re-perceive under a different category. Different from inverting one assumption.</td></tr>
+    <tr><td><code>Futures</code></td><td>Four temporal horizons (+1y / +3y / +10y / +30y). Identify what's obvious from each future, ship the v0.1 today.</td></tr>
+    <tr><td><code>Dream</code></td><td>Dreaming mode — prediction-error offline. Generative model runs free, <b>no feasibility constraint</b>. Output is a dream image + "what survives waking" interpretation.</td></tr>
+    <tr><td><code>Lucid</code></td><td>Lucid dreaming — dream with a directional prior you inject. Hallucination biases toward your prior; one reality check at the end. More salvage than pure dream.</td></tr>
+  </table>
+  <p><b>Flags:</b> <code>refine</code> = score every idea, pick winner, harden it. <code>evolve_deck</code> = after refine, sharpen winning cards back into the deck cache. <code>theme_entropy</code> = how distant the auto-generated donor domains should be (0 = in-field; 1 = wildly distant).</p>
+</details>
 
 <form id="form">
   <label>
@@ -769,9 +834,36 @@ INDEX_HTML = r"""<!doctype html>
   </label>
 
   <label class="inline">
+    <input type="checkbox" name="dream">
+    Dream mode — prediction-error offline. Generative model runs free, no feasibility constraint. Output is a dream image + "what survives waking". Uses n_ideas.
+  </label>
+
+  <label>
+    Lucid prior (optional — enables Lucid Dreaming mode)
+    <textarea name="lucid" rows="2"
+      placeholder="A directional belief the dream should bias toward, e.g. 'the team must stay solo-founder-sized'. Leave empty to skip."></textarea>
+  </label>
+
+  <label class="inline">
     <input type="checkbox" name="evolve_deck">
     Evolve deck — when refine produces a winner, sharpen the cards that contributed and write them back to the deck cache. Requires refine. Not compatible with bring-your-own-deck.
   </label>
+
+  <details class="advanced">
+    <summary>Theme generator (advanced)</summary>
+    <label>
+      Theme entropy override (0..1) — how distant from your field the
+      auto-generated donor domains should be. Empty = use the run's main
+      entropy. 0 = stay in-field; 1 = wildly distant.
+      <input type="text" name="theme_entropy" placeholder="(empty = follow entropy)">
+    </label>
+    <label>
+      Explicit themes (comma-separated). Overrides the auto-generated theme
+      list. Example: <code>harbor pilotage, mycology, monastic rules</code>.
+      <textarea name="themes" rows="2"
+        placeholder="domain, domain, domain"></textarea>
+    </label>
+  </details>
 
   <details class="advanced">
     <summary>Bring your own deck (optional)</summary>
@@ -806,9 +898,10 @@ form.addEventListener('submit', async (e) => {
   for (const k of Object.keys(startByPhase)) delete startByPhase[k];
 
   const fd = new FormData(form);
-  const modesOn = ['einstein', 'lsd', 'futures'].filter(k => fd.get(k)).length;
+  const modesOn = ['einstein', 'lsd', 'futures', 'dream'].filter(k => fd.get(k)).length
+                + (fd.get('lucid') ? 1 : 0);
   if (modesOn > 1) {
-    addPanel('<div class="error">Einstein, LSD, and Futures modes are ' +
+    addPanel('<div class="error">Einstein / LSD / Futures / Dream / Lucid modes are ' +
              'mutually exclusive. Pick at most one.</div>');
     return;
   }
@@ -826,7 +919,16 @@ form.addEventListener('submit', async (e) => {
   for (const [k, v] of fd.entries()) {
     if (v === '') continue;
     if (['cards','n_concepts','n_ideas','seed'].includes(k)) payload[k] = Number(v);
-    else if (['regen_deck','refine','einstein','lsd','futures','evolve_deck'].includes(k)) payload[k] = true;
+    else if (k === 'theme_entropy') {
+      const t = Number(v);
+      if (!isNaN(t)) payload.theme_entropy = t;
+    }
+    else if (['regen_deck','refine','einstein','lsd','futures','dream','evolve_deck'].includes(k)) payload[k] = true;
+    else if (k === 'themes') {
+      // comma- or newline-separated; empty => omit
+      const parts = String(v).split(/[,\n]+/).map(s => s.trim()).filter(Boolean);
+      if (parts.length) payload.themes = parts;
+    }
     else if (k === 'bank_data') {
       try {
         payload.bank_data = JSON.parse(v);
@@ -907,7 +1009,13 @@ function handleEvent(chunk) {
   } else if (event === 'sample') {
     const cardHtml = obj.cards.map(renderCard).join('');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (
+          obj.mechanism === 'Prior Dissolution' ? ' lsd' :
+          obj.mechanism === 'Dreaming' ? ' dream' :
+          obj.mechanism === 'Lucid Dreaming' ? ' lucid' :
+          obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' :
+          ''
+        ) + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     const blurb = obj.mechanism_blurb
       ? '<div class="mech-blurb">' + escapeHtml(obj.mechanism_blurb) + '</div>'
@@ -923,7 +1031,13 @@ function handleEvent(chunk) {
   } else if (event === 'idea') {
     finishStatus('synth-' + obj.i, 'idea ' + (obj.i + 1) + ' ready');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (
+          obj.mechanism === 'Prior Dissolution' ? ' lsd' :
+          obj.mechanism === 'Dreaming' ? ' dream' :
+          obj.mechanism === 'Lucid Dreaming' ? ' lucid' :
+          obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' :
+          ''
+        ) + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     addPanel(
       '<div class="meta">Idea ' + (obj.i + 1) + mechTag + '</div>' +
@@ -933,7 +1047,13 @@ function handleEvent(chunk) {
     finishStatus('critic-' + obj.i,
                  'idea ' + (obj.i + 1) + ' scored ' + obj.total + '/300');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (
+          obj.mechanism === 'Prior Dissolution' ? ' lsd' :
+          obj.mechanism === 'Dreaming' ? ' dream' :
+          obj.mechanism === 'Lucid Dreaming' ? ' lucid' :
+          obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' :
+          ''
+        ) + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     addPanel(
       '<div class="meta">Score · idea ' + (obj.i + 1) + mechTag + '</div>' +

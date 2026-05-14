@@ -50,12 +50,16 @@ from telegram.ext import (
 
 from aidea import (
     CARD_DEPTH_BY_NAME,
+    DREAM_LABEL,
     EINSTEIN_MECHANISMS,
     FUTURES_HORIZONS,
     LSD_LABEL,
+    LUCID_LABEL,
+    build_dream_prompt,
     build_einstein_prompt,
     build_futures_prompt,
     build_lsd_prompt,
+    build_lucid_prompt,
     build_prompt,
     critic_score,
     load_or_generate_deck,
@@ -253,7 +257,8 @@ async def run_pipeline_for_telegram(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     topic: str,
-    mode: str,  # 'default' | 'einstein' | 'lsd' | 'futures'
+    mode: str,  # 'default' | 'einstein' | 'lsd' | 'futures' | 'dream' | 'lucid'
+    extra: dict | None = None,
 ) -> None:
     chat_id = update.effective_chat.id
     state = state_for(chat_id)
@@ -314,6 +319,7 @@ async def run_pipeline_for_telegram(
         )
 
         # Decide passes
+        lucid_prior = (extra or {}).get("lucid_prior", "")
         if mode == "einstein":
             passes = [
                 (("einstein", k), m["label"]) for k, m in EINSTEIN_MECHANISMS.items()
@@ -323,6 +329,12 @@ async def run_pipeline_for_telegram(
         elif mode == "futures":
             passes = [
                 (("futures", h["key"]), h["label"]) for h in FUTURES_HORIZONS
+            ]
+        elif mode == "dream":
+            passes = [(("dream", None), DREAM_LABEL) for _ in range(s.n_ideas)]
+        elif mode == "lucid":
+            passes = [
+                (("lucid", lucid_prior), LUCID_LABEL) for _ in range(s.n_ideas)
             ]
         else:
             passes = [((None, None), None) for _ in range(s.n_ideas)]
@@ -340,6 +352,10 @@ async def run_pipeline_for_telegram(
                 prompt = build_lsd_prompt(topic, drawn)
             elif m == "futures":
                 prompt = build_futures_prompt(topic, drawn, mk)
+            elif m == "dream":
+                prompt = build_dream_prompt(topic, drawn)
+            elif m == "lucid":
+                prompt = build_lucid_prompt(topic, drawn, mk or "")
             else:
                 prompt = build_prompt(topic, drawn, level)
 
@@ -465,17 +481,37 @@ async def run_pipeline_for_telegram(
 
 HELP_TEXT = (
     "AIdea — applied-ideas synthesizer with entropy controls.\n\n"
-    "Commands:\n"
-    "/idea <topic>      one idea at the current entropy\n"
-    "/einstein <topic>  four mechanism-specific ideas (Adjacent Possible, "
-    "Exaptation, Slow Hunch, Productive Error)\n"
-    "/lsd <topic>       prior dissolution — re-perceive under a different frame\n"
-    "/futures <topic>   temporal projection (+1y/+3y/+10y/+30y)\n"
-    "/settings          show current entropy/deck/depth/refine knobs\n"
-    "/set <k>=<v>       tune one knob (entropy, cards, card_depth, n_concepts, "
-    "n_ideas, refine, evolve_deck, seed)\n"
-    "/usage             LLM usage + subscription-window state\n"
-    "/cancel            abort the current task in this chat\n"
+    "Pipeline: topic → donor-deck (cards from many domains) → "
+    "stochastic sample at entropy → synthesis → optional critic + refine.\n\n"
+    "Modes (pick one):\n"
+    "/idea <topic>      default — n_ideas at the current entropy, feasibility "
+    "required\n"
+    "/einstein <topic>  four mechanism-specific ideas:\n"
+    "     Adjacent Possible — step through a just-unlocked door\n"
+    "     Exaptation — transplant a mechanism from another field\n"
+    "     Slow Hunch — articulate a latent tension in the field\n"
+    "     Productive Error — invert a load-bearing assumption\n"
+    "/lsd <topic>       Prior Dissolution — predictive-processing framing: "
+    "suspend the field's interpretive prior and re-perceive\n"
+    "/futures <topic>   Temporal projection (+1y / +3y / +10y / +30y). "
+    "Identify what is obvious from each future, ship the v0.1 today\n"
+    "/dream <topic>     Unconstrained dream — prediction-error OFFLINE, no "
+    "feasibility check. Output is a dream image + post-wake interpretation\n"
+    "/lucid <prior> | <topic>   Lucid dream — dream that resolves toward "
+    "your injected prior. Example: /lucid energy-based | reducing churn\n\n"
+    "Settings:\n"
+    "/settings              show current entropy / deck / depth / refine knobs\n"
+    "/set <k>=<v>           tune one knob (entropy, cards, card_depth, "
+    "n_concepts, n_ideas, refine, evolve_deck, seed)\n"
+    "/set themes=…          comma-separated donor domains (overrides "
+    "auto-generation)\n"
+    "/set theme_entropy=X   0..1 — how far the auto-themes wander\n\n"
+    "Flags (set via /set):\n"
+    "  refine=true       score every idea and refine the winner\n"
+    "  evolve_deck=true  after refine, sharpen winning cards into the cache\n\n"
+    "Other:\n"
+    "/usage   local LLM-API usage + observed subscription-window state\n"
+    "/cancel  abort the current task in this chat\n"
 )
 
 
@@ -535,6 +571,105 @@ async def cmd_futures(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await run_pipeline_for_telegram(
         update=update, context=ctx, topic=topic, mode="futures",
     )
+
+
+async def cmd_dream(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    topic = _topic_from(update)
+    if not topic:
+        await update.message.reply_text(
+            "usage: /dream <topic>\n"
+            "Dreaming mode: prediction-error offline. The output ignores "
+            "feasibility constraints and names what survives waking."
+        )
+        return
+    await run_pipeline_for_telegram(
+        update=update, context=ctx, topic=topic, mode="dream",
+    )
+
+
+async def cmd_lucid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # /lucid <prior> :: <topic>   — prior and topic separated by " :: "
+    # If no separator is present, treat everything as topic with empty prior
+    # (degrades to dream mode behavior).
+    raw = _topic_from(update)
+    if not raw:
+        await update.message.reply_text(
+            "usage:\n"
+            "  /lucid <directional prior> :: <topic>\n"
+            "Example:\n"
+            "  /lucid the team must stay solo-founder-sized :: "
+            "growing my consultancy without hiring\n\n"
+            "The dream biases toward your injected prior; one reality "
+            "check fires at the end."
+        )
+        return
+    # Accept '::' or '|' as the prior/topic separator.
+    sep = "::" if "::" in raw else ("|" if "|" in raw else None)
+    if sep is not None:
+        prior, _, topic = raw.partition(sep)
+        prior = prior.strip()
+        topic = topic.strip()
+    else:
+        prior, topic = "", raw
+    if not topic:
+        await update.message.reply_text(
+            "usage: /lucid <prior> :: <topic> (topic was empty)",
+        )
+        return
+    await run_pipeline_for_telegram(
+        update=update, context=ctx, topic=topic, mode="lucid",
+        extra={"lucid_prior": prior},
+    )
+
+
+MODES_TEXT = (
+    "AIdea modes — pick at most one per request\n\n"
+    "/idea <topic>\n"
+    "  Default. n_ideas ideas at your current entropy. Feasibility "
+    "required. Use /set entropy=mad for the wildest still-shippable "
+    "variant.\n\n"
+    "/einstein <topic>\n"
+    "  Four mechanism-specific passes:\n"
+    "   • Adjacent Possible — step through a recently-unlocked door\n"
+    "   • Exaptation — transplant a mechanism from an unrelated field\n"
+    "   • Slow Hunch — articulate a latent tension\n"
+    "   • Productive Error — invert a load-bearing assumption\n"
+    "  Forces n_ideas=4. Pair with /set refine=true to rank them.\n\n"
+    "/lsd <topic>\n"
+    "  Prior Dissolution (Friston / Seth / REBUS). Suspend the field's "
+    "interpretive prior and re-perceive under a different category. "
+    "Dissolves the whole frame, not just one belief.\n\n"
+    "/futures <topic>\n"
+    "  Four temporal horizons (+1y / +3y / +10y / +30y). For each, name "
+    "what's obvious from there and ship a v0.1 today that walks toward "
+    "it.\n\n"
+    "/dream <topic>\n"
+    "  Prediction-error offline. No feasibility constraint. Output is a "
+    "dream image + 'what survives waking'. For harvesting fragments, not "
+    "shipping.\n\n"
+    "/lucid <prior> :: <topic>\n"
+    "  Dream + a directional prior you inject. Hallucination biases toward "
+    "your prior; one reality check at the end. More salvage than pure "
+    "dream.\n"
+    "  Example: /lucid solo-founder only :: how do I monetize my AI tool\n\n"
+    "Knobs (set via /set k=v):\n"
+    "  entropy=sane|wild|insane|crazy|mad   (or float 0..1)\n"
+    "  cards=N                              deck size\n"
+    "  card_depth=shallow|medium|deep|max\n"
+    "  n_concepts=K                         cards drawn per idea\n"
+    "  n_ideas=N                            ideas per run (default mode)\n"
+    "  refine=true|false                    score + refine winner\n"
+    "  evolve_deck=true|false               sharpen winning cards back\n"
+    "  seed=N                               reproducible runs\n\n"
+    "Inspection:\n"
+    "  /settings   show current knob values\n"
+    "  /usage      LLM usage + observed subscription window\n"
+    "  /cancel     abort the in-flight request in this chat\n"
+)
+
+
+async def cmd_modes(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(MODES_TEXT)
 
 
 async def cmd_settings(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -666,6 +801,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("einstein", cmd_einstein))
     app.add_handler(CommandHandler("lsd", cmd_lsd))
     app.add_handler(CommandHandler("futures", cmd_futures))
+    app.add_handler(CommandHandler("dream", cmd_dream))
+    app.add_handler(CommandHandler("lucid", cmd_lucid))
+    app.add_handler(CommandHandler("modes", cmd_modes))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("usage", cmd_usage))

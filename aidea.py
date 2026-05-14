@@ -300,6 +300,103 @@ class Card:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Entropy-biased theme generator: an LLM-picked list of donor domains tuned
+# to the requested entropy, replacing the previously hardcoded landscape.
+# ---------------------------------------------------------------------------
+
+
+THEMES_SYSTEM = (
+    "You pick donor domains for an applied-ideas tool. Output ONE domain "
+    "name per line, no preamble, no commentary, no numbering, no surrounding "
+    "code fence. Domain names should be specific noun-phrases that suggest "
+    "where structural mechanisms live (e.g. 'harbor pilotage', 'monastic "
+    "rules', 'mycorrhizal symbiosis'), not generic categories ('transport', "
+    "'religion', 'biology')."
+)
+
+
+def _theme_guidance(theme_entropy: float) -> str:
+    """Map entropy to instructions for how distant the donor domains should be."""
+    if theme_entropy < 0.3:
+        return (
+            "STAY CLOSE. Pick 4-5 specific sub-disciplines INSIDE the user's "
+            "home field and 2-3 of its nearest neighbors. Surprise should "
+            "come from depth (specificity), not distance."
+        )
+    if theme_entropy < 0.6:
+        return (
+            "MIX. Pick at least 4 recognizable fields plus at least 2 "
+            "lateral domains the user would not spontaneously reach for. "
+            "Balance familiarity with novelty."
+        )
+    if theme_entropy < 0.9:
+        return (
+            "GO DISTANT. At least 6 domains should sit far from the user's "
+            "home field. Include 2 obscure specialist domains the user has "
+            "probably never named (e.g. 'lacquerware restoration', "
+            "'reservoir sedimentation', 'medieval bestiaries')."
+        )
+    return (
+        "GO MAXIMALLY DISTANT. Span hard science, manual trades, religious "
+        "practice, ancient history, niche sports, obscure crafts, animal "
+        "behavior, military doctrine, art movements, dead industries. If a "
+        "domain name does not make the user blink, you picked the wrong one. "
+        "Reach for the unfamiliar."
+    )
+
+
+THEMES_PROMPT_TEMPLATE = """\
+Pick {n_themes} donor domains for cross-pollination with this user
+problem / question / project:
+
+  {topic}
+
+Entropy of theme selection: {entropy_pct:.0f}% — see guidance below.
+
+Guidance:
+{guidance}
+
+Output exactly {n_themes} domain names, one per line, no numbering, no
+bullets, no commentary. The names must be specific enough to suggest
+mechanisms — not bare category labels.
+
+Begin:"""
+
+
+async def generate_themes(
+    topic: str,
+    n_themes: int,
+    theme_entropy: float,
+    model: str,
+) -> list[str]:
+    """Ask the LLM to propose N donor domains, biased by entropy. Returns a
+    de-duplicated, length-capped list of domain names."""
+    prompt = THEMES_PROMPT_TEMPLATE.format(
+        topic=topic.strip(),
+        n_themes=n_themes,
+        entropy_pct=theme_entropy * 100,
+        guidance=_theme_guidance(theme_entropy),
+    )
+    text = await _query_text(prompt, THEMES_SYSTEM, model, kind="themes")
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        # Strip common bullet / numbering artifacts the model sometimes adds.
+        line = re.sub(r"^[\-\*••]\s+", "", line)
+        line = re.sub(r"^\d+[\.\)]\s+", "", line)
+        line = line.strip("`*_ \"'")
+        if not line or len(line) > 80:
+            continue
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(line)
+    return out[:n_themes]
+
+
 DECK_GEN_SYSTEM = (
     "You generate donor concept decks for an idea-synthesis tool. Your output "
     "is JSON Lines (one JSON object per line, no commentary, no surrounding "
@@ -307,22 +404,46 @@ DECK_GEN_SYSTEM = (
 )
 
 
-def _deck_gen_prompt(topic: str, n: int, depth: CardDepth) -> str:
+def _deck_gen_prompt(
+    topic: str,
+    n: int,
+    depth: CardDepth,
+    themes: list[str] | None = None,
+) -> str:
     field_list = ", ".join(f'"{f}"' for f in depth.fields)
+    if themes:
+        domains_clause = (
+            "Pull concepts from the following donor domains (use all or a "
+            "subset — if a domain does not yield a transferable mechanism, "
+            "skip it rather than force):\n"
+            + "\n".join(f"  - {t}" for t in themes)
+        )
+        spread_clause = (
+            "- Spread the deck ACROSS the listed donor domains. Aim for at "
+            "least half of them to be represented."
+        )
+    else:
+        # Fallback if themes weren't generated for whatever reason — keep
+        # the legacy guidance so the pipeline still works degraded.
+        domains_clause = (
+            "Pull from a wide range of source domains (biology, physics, "
+            "computing, economics, art, urbanism, psychology, linguistics, "
+            "history, music, warfare, religion, law, sports, etc.)."
+        )
+        spread_clause = "- Span at least 8 distinct source domains."
     return f"""\
 Generate {n} donor concepts that could cross-pollinate with this user topic:
 
   {topic.strip()}
 
-These will be shuffled to inject controlled entropy into idea generation.
-Optimize for BREADTH of source domains and STRUCTURAL diversity. Aim for
-concepts whose mechanisms are domain-independent enough to be transferable,
-not concepts that already live near the user's topic.
+{domains_clause}
+
+Optimize for STRUCTURAL diversity. Aim for concepts whose mechanisms are
+domain-independent enough to be transferable, not concepts that already
+live near the user's topic.
 
 Hard requirements:
-- Span at least 8 distinct source domains (biology, physics, computing,
-  economics, art, urbanism, psychology, linguistics, history, music,
-  warfare, religion, law, sports, etc.). Do not cluster.
+{spread_clause}
 - Avoid domains that would feel obvious for this topic — pick the
   unobvious-but-transferable instead.
 - No duplicates. No near-duplicates.
@@ -400,9 +521,44 @@ async def generate_deck(
     depth: CardDepth,
     model: str,
     verbose: bool,
+    theme_entropy: float = 0.5,
+    themes: list[str] | None = None,
 ) -> list[Card]:
-    """One LLM call -> a topic-aware donor deck. Usage recorded as kind='deck'."""
-    prompt = _deck_gen_prompt(topic, n, depth)
+    """Generate a topic-aware donor deck.
+
+    Two LLM steps unless ``themes`` is provided:
+      1) ``generate_themes`` picks N donor domains biased by
+         ``theme_entropy``  — 0 = inside the user's home field,
+         1 = wildly distant specialist domains.
+      2) ``_deck_gen_prompt`` produces the deck spread across those domains.
+
+    Usage records: ``kind='themes'`` then ``kind='deck'``.
+    """
+    if themes is None:
+        n_themes = max(6, min(20, n // 3))
+        if verbose:
+            print(
+                f"[deck] picking {n_themes} themes (entropy={theme_entropy:.2f})...",
+                flush=True,
+            )
+        themes = await generate_themes(topic, n_themes, theme_entropy, model)
+        if verbose and themes:
+            preview = ", ".join(themes[:8]) + (
+                "..." if len(themes) > 8 else ""
+            )
+            print(f"[deck] themes: {preview}", flush=True)
+        try:
+            from transcripts import log_event as _tlog
+            _tlog(
+                "themes",
+                themes=themes,
+                theme_entropy=theme_entropy,
+                topic=topic,
+            )
+        except Exception:
+            pass
+
+    prompt = _deck_gen_prompt(topic, n, depth, themes=themes or None)
 
     if verbose:
         print(f"[deck] generating {n} cards at depth={depth.name}...", flush=True)
@@ -420,6 +576,8 @@ async def load_or_generate_deck(
     model: str,
     force_regen: bool,
     verbose: bool,
+    theme_entropy: float = 0.5,
+    themes: list[str] | None = None,
 ) -> list[Card]:
     path = _deck_cache_path(topic, n, depth, model)
     if path.exists() and not force_regen:
@@ -427,7 +585,10 @@ async def load_or_generate_deck(
             print(f"[deck] using cached deck at {path}", flush=True)
         data = json.loads(path.read_text())
         return [Card(**c) for c in data]
-    cards = await generate_deck(topic, n, depth, model, verbose)
+    cards = await generate_deck(
+        topic, n, depth, model, verbose,
+        theme_entropy=theme_entropy, themes=themes,
+    )
     if not cards:
         raise RuntimeError(
             "Deck generation produced no parseable cards. "
@@ -922,6 +1083,140 @@ def build_futures_prompt(
         seeds=seeds,
         horizon_name=h["horizon_name"],
         framing=h["framing"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dreaming Mode: prediction-error signal offline. Generative model runs
+# free, no feasibility constraint, no "ship by Friday". Output is a "dream
+# image" — vivid, possibly impossible, internally coherent — plus an
+# explicit "what survives waking" interpretation pass.
+# ---------------------------------------------------------------------------
+
+
+DREAM_LABEL = "Dreaming"
+
+
+DREAM_PROMPT_TEMPLATE = """\
+The user is working on this problem / question / project:
+
+  {topic}
+
+This synthesis uses DREAMING MODE. Predictive-processing framing: in
+sleep the prediction-error signal is offline, so the brain's generative
+model runs without external correction. The job is to do the same — let
+the generative model run free, ignore "what's buildable today", and
+emit a dream image. Internal coherence is the only hard rule;
+physical / economic / political plausibility is NOT.
+
+Donor concepts (let them combine in unexpected ways; pick the ones that
+grip you emotionally, not the ones a rational planner would pick):
+{seeds}
+
+Process:
+1. Pick whichever donor concepts have the strongest pull. Don't decide
+   rationally — pick by feel.
+2. Build a vivid scene, system, or experience that fuses them. Present
+   tense, sensory detail welcome. Internal dream-logic, not external
+   physics.
+3. The dream must still be ABOUT the user's stated topic — it cannot
+   wander off-topic — but it may render the topic in literally
+   impossible form (negative time, inverse causality, anthropomorphic
+   abstractions, etc.).
+4. Finish with a "What survives waking" line that names ONE fragment
+   the user could actually salvage when they open their eyes.
+
+Hard requirements (only these — every other waking constraint is OFF):
+  - The dream must address the user's stated topic.
+  - The "What survives waking" line must identify at least one fragment
+    that could be acted on tomorrow, even if the rest of the dream is
+    unrealisable.
+
+Respond in EXACTLY this format, no preamble:
+
+Title: <3-7 evocative words>
+Mechanism: Dreaming
+The dream image: <2-5 sentences. Present tense. Sensory. Implausible
+  is fine; incoherent is not.>
+Which donors fused: <name the 1-3 donor concepts whose collision produced this>
+Why these collided: <1-2 sentences>
+What survives waking: <1-2 sentences naming the salvageable fragment>
+First step the user could take this week: <one concrete action, OR the literal phrase "(none — this is dream material only)">
+"""
+
+
+def build_dream_prompt(topic: str, cards: list[Card]) -> str:
+    seeds = "\n".join(card.render() for card in cards)
+    return DREAM_PROMPT_TEMPLATE.format(
+        topic=topic.strip(),
+        seeds=seeds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lucid Dreaming Mode: hybrid. The prediction-error signal is still
+# relaxed (the generative model runs free), but metacognition is online
+# and the USER injects a directional prior the dream must bias toward.
+# Includes a single "reality check" that swaps out the most internally
+# inconsistent element. Output retains more salvage than pure dream.
+# ---------------------------------------------------------------------------
+
+
+LUCID_LABEL = "Lucid Dreaming"
+
+
+LUCID_PROMPT_TEMPLATE = """\
+The user is working on this problem / question / project:
+
+  {topic}
+
+The user has injected this directional prior — a high-confidence belief
+the dream must bias toward (do not argue with it; honor it):
+
+  {prior}
+
+This synthesis uses LUCID DREAMING. Like dreams, the prediction-error
+signal is relaxed and you may generate without feasibility constraints.
+UNLIKE dreams, metacognition is online: the user has told you which
+direction the hallucination should bias toward, and once the dream is
+built you must perform exactly ONE reality check — identify the most
+internally inconsistent element and either justify it or swap it for
+something the dream can actually sustain.
+
+Donor concepts (raw material; the injected prior should color which
+ones grip you most):
+{seeds}
+
+Process:
+1. Treat the injected prior as a fixed truth in the dream world.
+2. Hallucinate a vivid idea that addresses the user's stated topic
+   AND honors the prior.
+3. Reality check: pick the single most absurd element of your dream.
+   If it has internal coherence (dream-logic), keep it. If it
+   contradicts the prior or contradicts itself, swap it for something
+   the dream can sustain.
+4. Identify what survives waking — more than dreaming-mode does,
+   because the prior keeps the hallucination anchored.
+
+Respond in EXACTLY this format, no preamble:
+
+Title: <3-7 evocative words>
+Mechanism: Lucid Dreaming
+Injected prior: {prior}
+The dream image (biased toward the prior): <2-5 sentences. Present tense.>
+Reality check: <which element you tested, what you decided>
+What survives waking: <2-3 sentences naming the executable fragment>
+First step the user could take this week: <one concrete action>
+Risks / what could still break on waking: <1-2 sentences>
+"""
+
+
+def build_lucid_prompt(topic: str, cards: list[Card], prior: str) -> str:
+    seeds = "\n".join(card.render() for card in cards)
+    return LUCID_PROMPT_TEMPLATE.format(
+        topic=topic.strip(),
+        seeds=seeds,
+        prior=prior.strip() or "(no prior provided — fall back to pure dream)",
     )
 
 
@@ -1531,6 +1826,49 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--dream",
+        action="store_true",
+        help=(
+            "Dreaming mode: prediction-error signal offline. Generates a "
+            "dream image with no feasibility constraint, then names what "
+            "survives waking. Mutually exclusive with --einstein / --lsd / "
+            "--futures / --lucid."
+        ),
+    )
+    p.add_argument(
+        "--lucid",
+        type=str,
+        default=None,
+        metavar="PRIOR",
+        help=(
+            "Lucid dreaming mode: relaxed prediction error + a directional "
+            "prior the dream biases toward. Pass the prior as a sentence, "
+            "e.g. --lucid 'the team must stay solo-founder-sized'. "
+            "Mutually exclusive with the other mode flags."
+        ),
+    )
+    p.add_argument(
+        "--themes",
+        type=str,
+        default=None,
+        metavar="LIST",
+        help=(
+            "Override the auto-generated donor-domain themes. Comma-separated "
+            "list, e.g. --themes 'harbor pilotage, mycology, monastic rules'."
+        ),
+    )
+    p.add_argument(
+        "--theme-entropy",
+        type=float,
+        default=None,
+        metavar="X",
+        help=(
+            "Theme-selection entropy in [0,1]. 0 = stay in the user's home "
+            "field; 1 = wildly distant specialist domains. Defaults to the "
+            "value of --entropy."
+        ),
+    )
+    p.add_argument(
         "--evolve-deck",
         action="store_true",
         help=(
@@ -1544,10 +1882,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.n_concepts < 2:
         p.error("--n-concepts must be at least 2 (blending needs >= 2 seeds)")
-    modes_on = sum(1 for f in (args.einstein, args.lsd, args.futures) if f)
-    if modes_on > 1:
+    mode_flags = (
+        args.einstein, args.lsd, args.futures, args.dream, bool(args.lucid),
+    )
+    if sum(1 for f in mode_flags if f) > 1:
         p.error(
-            "--einstein, --lsd, --futures are mutually exclusive; pick one."
+            "--einstein / --lsd / --futures / --dream / --lucid are mutually "
+            "exclusive; pick at most one."
         )
     if args.evolve_deck and args.bank:
         p.error("--evolve-deck requires a generated deck; not compatible with --bank")
@@ -1635,6 +1976,16 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         deck = cards_from_static_bank(load_bank(args.bank))
         deck_origin = f"static bank: {args.bank}"
     else:
+        explicit_themes: list[str] | None = None
+        if args.themes:
+            explicit_themes = [
+                t.strip() for t in args.themes.split(",") if t.strip()
+            ] or None
+        theme_entropy = (
+            args.theme_entropy
+            if args.theme_entropy is not None
+            else spread
+        )
         deck = await load_or_generate_deck(
             topic=args.topic,
             n=args.cards,
@@ -1642,9 +1993,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             model=args.model,
             force_regen=args.regen_deck,
             verbose=not args.quiet,
+            theme_entropy=theme_entropy,
+            themes=explicit_themes,
         )
         deck_origin = (
-            f"topic-aware deck (n={len(deck)}, depth={depth.name})"
+            f"topic-aware deck (n={len(deck)}, depth={depth.name}, "
+            f"theme_entropy={theme_entropy:.2f})"
         )
 
     transcript_log(
@@ -1664,9 +2018,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         print()
 
     # Mode mutual exclusion (parse_args also enforces this; belt and braces).
-    if sum(1 for f in (args.einstein, args.lsd, args.futures) if f) > 1:
+    _mode_flags = (
+        args.einstein, args.lsd, args.futures, args.dream, bool(args.lucid),
+    )
+    if sum(1 for f in _mode_flags if f) > 1:
         print(
-            "error: --einstein, --lsd, --futures are mutually exclusive.",
+            "error: --einstein / --lsd / --futures / --dream / --lucid are mutually exclusive.",
             file=sys.stderr,
         )
         return 2
@@ -1676,7 +2033,77 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     mechanisms_used: list[str | None] = []
     cards_per_idea: list[list[Card]] = []
 
-    if args.futures:
+    if args.dream:
+        for i in range(args.n_ideas):
+            cards = sample_cards(
+                deck=deck, n=args.n_concepts, spread=spread, rng=rng,
+            )
+            header = (
+                f"\n=== Dream pass {i + 1}/{args.n_ideas}: Dreaming | "
+                f"entropy={level.name} (spread={spread:.2f}) | "
+                f"deck={len(deck)}@{depth.name} | model={args.model} ===\n"
+            )
+            print(header)
+            print(f"Topic: {args.topic.strip()}")
+            print(
+                "Mechanism: Dreaming — prediction-error offline; let the "
+                "generative model run free."
+            )
+            print("Sampled cards:")
+            for c in cards:
+                print(c.render())
+            print()
+            prompt = build_dream_prompt(args.topic, cards)
+            idea = await synthesize(
+                prompt=prompt, model=args.model,
+                stream_to_stdout=not args.quiet,
+            )
+            ideas.append(idea)
+            mechanisms_used.append(DREAM_LABEL)
+            cards_per_idea.append(cards)
+            transcript_log(
+                "idea", i=i, mechanism=DREAM_LABEL, text=idea,
+                cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in cards],
+            )
+            if args.quiet:
+                print(idea)
+    elif args.lucid:
+        for i in range(args.n_ideas):
+            cards = sample_cards(
+                deck=deck, n=args.n_concepts, spread=spread, rng=rng,
+            )
+            header = (
+                f"\n=== Lucid pass {i + 1}/{args.n_ideas}: Lucid Dreaming | "
+                f"entropy={level.name} (spread={spread:.2f}) | "
+                f"deck={len(deck)}@{depth.name} | model={args.model} ===\n"
+            )
+            print(header)
+            print(f"Topic: {args.topic.strip()}")
+            print(f"Injected prior: {args.lucid}")
+            print(
+                "Mechanism: Lucid Dreaming — relaxed feasibility, "
+                "user-injected prior, one reality check."
+            )
+            print("Sampled cards:")
+            for c in cards:
+                print(c.render())
+            print()
+            prompt = build_lucid_prompt(args.topic, cards, args.lucid)
+            idea = await synthesize(
+                prompt=prompt, model=args.model,
+                stream_to_stdout=not args.quiet,
+            )
+            ideas.append(idea)
+            mechanisms_used.append(LUCID_LABEL)
+            cards_per_idea.append(cards)
+            transcript_log(
+                "idea", i=i, mechanism=LUCID_LABEL, text=idea,
+                lucid_prior=args.lucid,
+                cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in cards],
+            )
+            if args.quiet:
+                print(idea)
+    elif args.futures:
         total = len(FUTURES_HORIZONS)
         for i, h in enumerate(FUTURES_HORIZONS):
             cards = sample_cards(
