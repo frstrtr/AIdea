@@ -33,16 +33,43 @@ import json
 import random
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_agent_sdk import (
     AssistantMessage,
+    CLIConnectionError,
+    CLIJSONDecodeError,
+    CLINotFoundError,
     ClaudeAgentOptions,
+    ClaudeSDKError,
+    ProcessError,
     RateLimitEvent,
     ResultMessage,
     TextBlock,
     query,
+)
+
+
+class EmptyResponseError(RuntimeError):
+    """The SDK delivered a ResultMessage with no usable assistant text.
+    Treated as transient — retry layer will back off and try again."""
+
+
+# Errors we retry on. CLINotFoundError (claude CLI missing) is non-transient
+# and surfaces immediately; CLIJSONDecodeError, ProcessError, and connection
+# errors are typically transient (process crash, network blip, brief rate
+# pressure). EmptyResponseError covers the case where the SDK silently
+# returned no text (e.g. a refusal or a server hiccup).
+_RETRYABLE: tuple[type[BaseException], ...] = (
+    CLIConnectionError,
+    CLIJSONDecodeError,
+    ProcessError,
+    asyncio.TimeoutError,
+    EmptyResponseError,
+    ConnectionError,
+    OSError,
 )
 
 from usage import (
@@ -919,17 +946,18 @@ SYNTHESIZER_SYSTEM = (
 )
 
 
-async def _run_query(
+async def _run_query_once(
     prompt: str,
     system: str,
     model: str,
     *,
     kind: str,
     stream_to_stdout: bool = False,
-) -> str:
-    """Drive one agent-SDK query: collect text, capture ResultMessage +
-    RateLimitEvent, write a usage record. Returns the concatenated assistant
-    text."""
+) -> tuple[str, object | None]:
+    """One uninstrumented attempt: drive an agent-SDK query, capture
+    ResultMessage + RateLimitEvent, write a usage record, return
+    (text, last_rate_limit_info). Raises ``EmptyResponseError`` if no
+    assistant text came back so the retry wrapper can catch it."""
     options = ClaudeAgentOptions(
         model=model,
         system_prompt=system,
@@ -968,7 +996,97 @@ async def _run_query(
         except Exception:
             pass
 
-    return "".join(chunks)
+    text = "".join(chunks)
+    if not text.strip():
+        # Treat as transient — usually means a rate-limit refusal or a
+        # claude-cli hiccup. Retry layer will back off.
+        err = getattr(result_message, "is_error", False)
+        stop = getattr(result_message, "stop_reason", None)
+        raise EmptyResponseError(
+            f"empty assistant response (is_error={err}, stop_reason={stop})"
+        )
+    return text, rate_limit_info
+
+
+def _backoff_seconds(attempt: int, rate_limit_info: object | None) -> float:
+    """Pick a delay for the next retry attempt.
+
+    Honors a RateLimitInfo.resets_at if present and in the future, capped
+    at 5 minutes. Otherwise: 1s, 2s, 4s, 8s, 16s, ... up to 30s.
+    """
+    if rate_limit_info is not None:
+        resets_at = getattr(rate_limit_info, "resets_at", None)
+        status = getattr(rate_limit_info, "status", None)
+        if (
+            isinstance(resets_at, (int, float))
+            and status not in (None, "allowed")
+        ):
+            wait = float(resets_at) - time.time()
+            if wait > 0:
+                return min(wait, 300.0)
+    # Exponential backoff with a 30s cap.
+    return float(min(2 ** (attempt - 1), 30))
+
+
+async def _run_query(
+    prompt: str,
+    system: str,
+    model: str,
+    *,
+    kind: str,
+    stream_to_stdout: bool = False,
+    max_attempts: int = 4,
+) -> str:
+    """Retry-wrapped agent-SDK call. All five LLM kinds (deck / synth /
+    critic / refine / evolve) flow through here, so retry policy is
+    enforced uniformly.
+
+    Transient failures (connection drops, JSON-decode errors, process
+    crashes, empty responses, rate-limit rejections) are retried with
+    exponential backoff. Rate-limit rejections wait until the
+    ``resets_at`` timestamp reported by the SDK when present. Hard
+    errors (the CLI binary missing, programmer mistakes) propagate
+    immediately."""
+    last_rate_limit: object | None = None
+    last_err: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            text, rl = await _run_query_once(
+                prompt, system, model,
+                kind=kind, stream_to_stdout=stream_to_stdout,
+            )
+            return text
+        except CLINotFoundError:
+            # claude CLI is missing on PATH — non-transient. Don't retry.
+            raise
+        except _RETRYABLE as e:
+            last_err = e
+            last_rate_limit = locals().get("rl", last_rate_limit)
+            if attempt >= max_attempts:
+                break
+            wait = _backoff_seconds(attempt, last_rate_limit)
+            print(
+                f"[retry] {kind} attempt {attempt}/{max_attempts} failed "
+                f"({type(e).__name__}: {e}); sleeping {wait:.1f}s",
+                file=sys.stderr, flush=True,
+            )
+            await asyncio.sleep(wait)
+        except ClaudeSDKError as e:
+            # Any other SDK error — single retry then give up.
+            last_err = e
+            if attempt >= max_attempts:
+                break
+            wait = _backoff_seconds(attempt, last_rate_limit)
+            print(
+                f"[retry] {kind} attempt {attempt}/{max_attempts} failed "
+                f"({type(e).__name__}: {e}); sleeping {wait:.1f}s",
+                file=sys.stderr, flush=True,
+            )
+            await asyncio.sleep(wait)
+    # Out of attempts.
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"_run_query exhausted attempts for kind={kind}")
 
 
 async def _query_text(prompt: str, system: str, model: str, *, kind: str = "misc") -> str:
