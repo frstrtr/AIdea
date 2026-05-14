@@ -25,6 +25,7 @@ against — same auth model as the web app.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -111,6 +112,11 @@ class ChatState:
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     last_run_id: str | None = None  # target of /feedback when no id is passed
     bootstrap_notice_sent: bool = False  # one-shot upfront notice during bootstrap
+    # Wall-clock seconds (time.time()) when the current run started. Used to
+    # show "elapsed Xs, ~Ys to go" in the busy-rejection message so users
+    # know the bot isn't stuck.
+    run_started_at: float = 0.0
+    run_eta: float = 0.0  # the ETA we promised when the run started
 
 
 # chat_id -> ChatState
@@ -181,6 +187,77 @@ def fmt_usd(n: float) -> str:
     if n < 0.01:
         return f"${n:.4f}"
     return f"${n:.2f}"
+
+
+# Fallback ETAs (seconds) when transcripts.jsonl has no matching history yet.
+# Rough order-of-magnitude — refined as soon as a few real runs of that mode
+# land in the history.
+_ETA_FALLBACK: dict[str, float] = {
+    "default": 35.0,
+    "einstein": 90.0,
+    "lsd": 65.0,
+    "futures": 90.0,
+    "dream": 40.0,
+    "lucid": 40.0,
+}
+
+
+def estimate_runtime_seconds(mode: str, refine: bool = False) -> float:
+    """Heuristic ETA for a request in ``mode`` based on recent transcripts.
+
+    Pairs (request_started, request_completed) by run_id over the last ~2000
+    transcript lines (cheap even for a long history), filters by matching
+    mode + refine flag, averages the last 10 durations. Falls back to a
+    hard-coded table when there is no matching history yet.
+    """
+    try:
+        from pathlib import Path
+        path = Path("transcripts.jsonl")
+        if not path.exists():
+            raise FileNotFoundError
+        with path.open(encoding="utf-8") as f:
+            lines = f.readlines()[-2000:]
+    except (OSError, FileNotFoundError):
+        base = _ETA_FALLBACK.get(mode, 45.0)
+        return base * (1.6 if refine else 1.0)
+
+    starts: dict[str, tuple[float, str, bool]] = {}
+    durations: list[float] = []
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        rid = ev.get("run_id")
+        if not rid:
+            continue
+        k = ev.get("kind")
+        if k == "request_started":
+            starts[rid] = (
+                float(ev.get("ts", 0) or 0),
+                str(ev.get("mode", "default")),
+                bool(ev.get("refine")),
+            )
+        elif k == "request_completed" and rid in starts:
+            ts_start, m, r = starts.pop(rid)
+            if m == mode and r == refine and ts_start > 0:
+                d = float(ev.get("ts", 0) or 0) - ts_start
+                if 1.0 < d < 600.0:  # ignore obviously broken entries
+                    durations.append(d)
+
+    if not durations:
+        base = _ETA_FALLBACK.get(mode, 45.0)
+        return base * (1.6 if refine else 1.0)
+    recent = durations[-10:]
+    return sum(recent) / len(recent)
+
+
+def fmt_eta(seconds: float) -> str:
+    """Human-friendly ETA. Sub-minute → 'Xs'; otherwise 'Xm Ys'."""
+    s = max(1, int(round(seconds)))
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m {s % 60:02d}s"
 
 
 # ---------------------------------------------------------------------------
@@ -272,14 +349,21 @@ async def run_pipeline_for_telegram(
     chat_id = update.effective_chat.id
     state = state_for(chat_id)
     if state.busy:
+        elapsed = max(0.0, time.time() - (state.run_started_at or time.time()))
+        remaining = max(1.0, (state.run_eta or 45.0) - elapsed)
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Already running a task in this chat. Use /cancel to abort it.",
+            text=(
+                f"⏳ Your previous request is still running "
+                f"(elapsed {fmt_eta(elapsed)}, ~{fmt_eta(remaining)} to go). "
+                "Send /cancel to abort, or wait."
+            ),
         )
         return
 
     state.busy = True
     state.cancel.clear()
+    state.run_started_at = time.time()
     run_id = start_run(f"tg-{chat_id}")
     state.last_run_id = run_id  # /feedback targets this run by default
     set_source(f"telegram-{chat_id}")
@@ -307,9 +391,12 @@ async def run_pipeline_for_telegram(
         refine=bool(s.refine), evolve_deck=bool(s.evolve_deck),
     )
 
+    eta = estimate_runtime_seconds(mode, refine=bool(s.refine))
+    state.run_eta = eta
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
+            f"📥 Got it — estimated reply in ~{fmt_eta(eta)}.\n"
             f"Topic: {topic}\n"
             f"mode={mode} · entropy={level.name} ({spread:.2f}) · "
             f"deck={s.cards}@{depth.name} · "
@@ -526,6 +613,8 @@ async def run_pipeline_for_telegram(
     finally:
         state.busy = False
         state.cancel.clear()
+        state.run_started_at = 0.0
+        state.run_eta = 0.0
 
 
 # ---------------------------------------------------------------------------
