@@ -65,6 +65,7 @@ from aidea import (
     synthesize,
     total_score,
 )
+from transcripts import log_event as transcript_log, set_source
 from usage import start_run, summarize
 
 logging.basicConfig(
@@ -266,9 +267,20 @@ async def run_pipeline_for_telegram(
     state.busy = True
     state.cancel.clear()
     run_id = start_run(f"tg-{chat_id}")
+    set_source(f"telegram-{chat_id}")
     s = state.settings
     spread, level = parse_entropy(s.entropy)
     depth = CARD_DEPTH_BY_NAME[s.card_depth]
+
+    transcript_log(
+        "request_started",
+        topic=topic, mode=mode,
+        chat_id=chat_id,
+        entropy=s.entropy, cards=s.cards, card_depth=s.card_depth,
+        n_concepts=s.n_concepts, n_ideas=s.n_ideas,
+        seed=s.seed, model=s.model,
+        refine=bool(s.refine), evolve_deck=bool(s.evolve_deck),
+    )
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -293,6 +305,12 @@ async def run_pipeline_for_telegram(
             ),
             update=update, context=context, cancel=state.cancel,
             headline="generating donor deck",
+        )
+        transcript_log(
+            "deck",
+            size=len(deck), depth=depth.name,
+            cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in deck],
+            source_kind="generated",
         )
 
         # Decide passes
@@ -334,6 +352,10 @@ async def run_pipeline_for_telegram(
             ideas.append(idea)
             cards_per_idea.append(drawn)
             mech_labels.append(label)
+            transcript_log(
+                "idea", i=i, mechanism=label, text=idea,
+                cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in drawn],
+            )
 
             header = (
                 f"Idea {i + 1}" +
@@ -353,6 +375,15 @@ async def run_pipeline_for_telegram(
                 score["i"] = i
                 score["total"] = total_score(score)
                 scored.append(score)
+                transcript_log(
+                    "score", i=i,
+                    mechanism=mech_labels[i] if i < len(mech_labels) else None,
+                    feasibility=score.get("feasibility"),
+                    unexpectedness=score.get("unexpectedness"),
+                    topic_fit=score.get("topic_fit"),
+                    total=score.get("total"),
+                    notes=score.get("notes", ""),
+                )
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -368,6 +399,12 @@ async def run_pipeline_for_telegram(
 
             winner = max(scored, key=lambda x: x["total"])
             wmech = mech_labels[winner["i"]] if mech_labels[winner["i"]] else ""
+            transcript_log(
+                "winner",
+                i=winner["i"], total=winner["total"],
+                mechanism=mech_labels[winner["i"]],
+                notes=winner.get("notes", ""),
+            )
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -386,6 +423,7 @@ async def run_pipeline_for_telegram(
                 update=update, context=context, cancel=state.cancel,
                 headline="refining winner",
             )
+            transcript_log("refined", i=winner["i"], text=refined)
             await send_idea(update, context, "Refined winner", refined)
 
         # Final usage summary
@@ -399,11 +437,19 @@ async def run_pipeline_for_telegram(
             f"{fmt_usd(run.get('total_cost_usd', 0))}"
         )
         await context.bot.send_message(chat_id=chat_id, text=text)
+        transcript_log(
+            "request_completed",
+            n_ideas=len(ideas), refined=bool(s.refine) and bool(ideas),
+        )
 
     except asyncio.CancelledError:
+        transcript_log("request_errored", error="cancelled")
         return
     except Exception as e:
         log.exception("pipeline failed")
+        transcript_log(
+            "request_errored", error_type=type(e).__name__, error=str(e),
+        )
         await context.bot.send_message(
             chat_id=chat_id, text=f"❌ pipeline failed: {e}",
         )

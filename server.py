@@ -125,8 +125,27 @@ def _card_to_dict(c: Card) -> dict:
 
 async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
     from usage import start_run, summarize as usage_summarize
+    from transcripts import set_source, log_event as transcript_log
     run_id = start_run("web")
+    set_source("web")
     yield _sse("run", {"run_id": run_id})
+
+    mode = (
+        "einstein" if req.einstein else
+        "lsd" if req.lsd else
+        "futures" if req.futures else
+        "default"
+    )
+    transcript_log(
+        "request_started",
+        topic=req.topic, mode=mode,
+        entropy=req.entropy, cards=req.cards, card_depth=req.card_depth,
+        n_concepts=req.n_concepts, n_ideas=req.n_ideas,
+        seed=req.seed, model=req.model,
+        refine=bool(req.refine), evolve_deck=bool(req.evolve_deck),
+        bank=req.bank, has_bank_data=req.bank_data is not None,
+        regen_deck=bool(req.regen_deck),
+    )
 
     modes_on = sum(1 for f in (req.einstein, req.lsd, req.futures) if f)
     if modes_on > 1:
@@ -217,6 +236,12 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         "depth": depth.name,
         "cards": [_card_to_dict(c) for c in deck],
     })
+    transcript_log(
+        "deck",
+        size=len(deck),
+        depth=depth.name,
+        cards=[_card_to_dict(c) for c in deck],
+    )
 
     # --- Stage 1 & 2: sample + synthesize, per idea -----------------------
     rng = random.Random(req.seed)
@@ -297,12 +322,17 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         ideas.append(idea)
         mechanism_labels.append(mech_label)
         cards_per_idea.append(cards)
-        cards_per_idea.append(cards)
         yield _sse("idea", {
             "i": i,
             "text": idea,
             "mechanism": mech_label,
         })
+        transcript_log(
+            "idea", i=i,
+            mechanism=mech_label,
+            text=idea,
+            cards=[_card_to_dict(c) for c in cards],
+        )
 
     # --- Stage 3: critic + refinement (optional) --------------------------
     if req.refine and ideas:
@@ -337,6 +367,15 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             )
             scored.append(score)
             yield _sse("score", score)
+            transcript_log(
+                "score", i=i,
+                mechanism=score.get("mechanism"),
+                feasibility=score.get("feasibility"),
+                unexpectedness=score.get("unexpectedness"),
+                topic_fit=score.get("topic_fit"),
+                total=score.get("total"),
+                notes=score.get("notes", ""),
+            )
 
         winner = max(scored, key=lambda s: s["total"])
         yield _sse("winner", {
@@ -345,6 +384,12 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             "notes": winner.get("notes", ""),
             "mechanism": winner.get("mechanism"),
         })
+        transcript_log(
+            "winner",
+            i=winner["i"], total=winner["total"],
+            mechanism=winner.get("mechanism"),
+            notes=winner.get("notes", ""),
+        )
 
         yield _sse("status", {
             "phase": "refine",
@@ -374,6 +419,7 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         assert refined is not None
 
         yield _sse("refined", {"i": winner["i"], "text": refined})
+        transcript_log("refined", i=winner["i"], text=refined)
 
         # --- Stage 4: deck evolution (opt-in) ----------------------------
         if req.evolve_deck and req.bank is None and req.bank_data is None:
@@ -415,21 +461,22 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
                         "message": f"deck cache write failed: {e}",
                     })
                     return
-                yield _sse("evolved", {
-                    "pairs": [
-                        {
-                            "before": _card_to_dict(o),
-                            "after": _card_to_dict(n),
-                        }
-                        for o, n in zip(winning_cards, evolved)
-                    ],
-                })
+                pairs = [
+                    {
+                        "before": _card_to_dict(o),
+                        "after": _card_to_dict(n),
+                    }
+                    for o, n in zip(winning_cards, evolved)
+                ]
+                yield _sse("evolved", {"pairs": pairs})
+                transcript_log("evolved", pairs=pairs)
 
     try:
         yield _sse("usage", usage_summarize(run_id=run_id))
     except Exception:
         pass
 
+    transcript_log("request_completed", n_ideas=len(ideas), refined=bool(req.refine))
     yield _sse("done", {})
 
 

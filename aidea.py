@@ -72,6 +72,7 @@ _RETRYABLE: tuple[type[BaseException], ...] = (
     OSError,
 )
 
+from transcripts import log_event as transcript_log
 from usage import (
     build_call_record,
     current_run_id,
@@ -1005,6 +1006,19 @@ async def _run_query_once(
         raise EmptyResponseError(
             f"empty assistant response (is_error={err}, stop_reason={stop})"
         )
+
+    # Log the full round-trip for future analysis.
+    transcript_log(
+        "llm_call",
+        call_kind=kind,
+        model=model,
+        system=system,
+        prompt=prompt,
+        response=text,
+        usage=(getattr(result_message, "usage", None) or {}),
+        total_cost_usd=float(getattr(result_message, "total_cost_usd", 0.0) or 0.0),
+        duration_ms=int(getattr(result_message, "duration_ms", 0) or 0),
+    )
     return text, rate_limit_info
 
 
@@ -1065,6 +1079,12 @@ async def _run_query(
             if attempt >= max_attempts:
                 break
             wait = _backoff_seconds(attempt, last_rate_limit)
+            transcript_log(
+                "llm_error",
+                call_kind=kind, attempt=attempt, max_attempts=max_attempts,
+                error_type=type(e).__name__, error=str(e),
+                sleep_s=wait, retryable=True,
+            )
             print(
                 f"[retry] {kind} attempt {attempt}/{max_attempts} failed "
                 f"({type(e).__name__}: {e}); sleeping {wait:.1f}s",
@@ -1077,6 +1097,12 @@ async def _run_query(
             if attempt >= max_attempts:
                 break
             wait = _backoff_seconds(attempt, last_rate_limit)
+            transcript_log(
+                "llm_error",
+                call_kind=kind, attempt=attempt, max_attempts=max_attempts,
+                error_type=type(e).__name__, error=str(e),
+                sleep_s=wait, retryable=False,
+            )
             print(
                 f"[retry] {kind} attempt {attempt}/{max_attempts} failed "
                 f"({type(e).__name__}: {e}); sleeping {wait:.1f}s",
@@ -1572,11 +1598,37 @@ def main(argv: list[str] | None = None) -> int:
 
 async def run_pipeline(args: argparse.Namespace) -> int:
     from usage import start_run
+    from transcripts import set_source
     run_id = start_run("cli")
+    set_source("cli")
     if not args.quiet:
         print(f"[usage] run_id={run_id}", file=sys.stderr)
     spread, level = parse_entropy(args.entropy)
     depth = CARD_DEPTH_BY_NAME[args.card_depth]
+
+    mode = (
+        "einstein" if args.einstein else
+        "lsd" if args.lsd else
+        "futures" if args.futures else
+        "default"
+    )
+    transcript_log(
+        "request_started",
+        topic=args.topic,
+        mode=mode,
+        entropy=level.name,
+        spread=spread,
+        cards=args.cards,
+        card_depth=depth.name,
+        n_concepts=args.n_concepts,
+        n_ideas=args.n_ideas,
+        seed=args.seed,
+        model=args.model,
+        refine=bool(args.refine),
+        evolve_deck=bool(args.evolve_deck),
+        bank=args.bank,
+        regen_deck=bool(args.regen_deck),
+    )
 
     # Resolve the donor deck: static bank OR topic-aware generation
     if args.bank:
@@ -1594,6 +1646,16 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         deck_origin = (
             f"topic-aware deck (n={len(deck)}, depth={depth.name})"
         )
+
+    transcript_log(
+        "deck",
+        origin=deck_origin,
+        size=len(deck),
+        depth=depth.name,
+        cards=[{
+            k: v for k, v in c.__dict__.items() if v is not None
+        } for c in deck],
+    )
 
     if args.show_deck:
         print(f"\n=== Donor deck ({deck_origin}) ===")
@@ -1644,6 +1706,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             ideas.append(idea)
             mechanisms_used.append(h["label"])
             cards_per_idea.append(cards)
+            transcript_log(
+                "idea", i=i,
+                mechanism=mechanisms_used[-1],
+                text=idea,
+                cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in cards],
+            )
 
             if args.quiet:
                 print(idea)
@@ -1679,6 +1747,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             ideas.append(idea)
             mechanisms_used.append(LSD_LABEL)
             cards_per_idea.append(cards)
+            transcript_log(
+                "idea", i=i,
+                mechanism=mechanisms_used[-1],
+                text=idea,
+                cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in cards],
+            )
 
             if args.quiet:
                 print(idea)
@@ -1714,6 +1788,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             ideas.append(idea)
             mechanisms_used.append(mech["label"])
             cards_per_idea.append(cards)
+            transcript_log(
+                "idea", i=i,
+                mechanism=mechanisms_used[-1],
+                text=idea,
+                cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in cards],
+            )
 
             if args.quiet:
                 print(idea)
@@ -1748,6 +1828,12 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             ideas.append(idea)
             mechanisms_used.append(None)
             cards_per_idea.append(cards)
+            transcript_log(
+                "idea", i=i,
+                mechanism=mechanisms_used[-1],
+                text=idea,
+                cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in cards],
+            )
 
             if args.quiet:
                 print(idea)
@@ -1760,6 +1846,15 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             score = await critic_score(args.topic, idea, args.model)
             score["i"] = i
             scored.append(score)
+            transcript_log(
+                "score", i=i,
+                mechanism=mechanisms_used[i] if i < len(mechanisms_used) else None,
+                feasibility=score["feasibility"],
+                unexpectedness=score["unexpectedness"],
+                topic_fit=score["topic_fit"],
+                total=total_score(score),
+                notes=score.get("notes", ""),
+            )
             tag = (
                 f" [{mechanisms_used[i]}]"
                 if i < len(mechanisms_used) and mechanisms_used[i]
@@ -1779,6 +1874,11 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             if winner["i"] < len(mechanisms_used) and mechanisms_used[winner["i"]]
             else ""
         )
+        transcript_log(
+            "winner", i=winner["i"], total=total_score(winner),
+            mechanism=mechanisms_used[winner["i"]] if winner["i"] < len(mechanisms_used) else None,
+            notes=winner.get("notes", ""),
+        )
         print(
             f"\n=== Winner: idea {winner['i'] + 1}{winner_mech} "
             f"(total {total_score(winner)}) — refining at low entropy ===\n"
@@ -1789,6 +1889,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             notes=winner.get("notes", ""),
             model=args.model,
         )
+        transcript_log("refined", i=winner["i"], text=refined)
         print(refined)
 
         # --- Deck evolution (opt-in via --evolve-deck) --------------------
@@ -1814,6 +1915,17 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 path = save_deck_to_cache(
                     args.topic, args.cards, depth, args.model, deck,
                 )
+                transcript_log(
+                    "evolved",
+                    pairs=[
+                        {
+                            "before": {k: v for k, v in o.__dict__.items() if v is not None},
+                            "after":  {k: v for k, v in n.__dict__.items() if v is not None},
+                        }
+                        for o, n in zip(cards_per_idea[winner["i"]], evolved)
+                    ],
+                    cache_path=str(path),
+                )
                 print(f"  wrote {len(evolved)} updated card(s) to {path}\n")
                 for original, new in zip(cards_per_idea[winner["i"]], evolved):
                     print(f"  ◆ {original.name} ({original.domain})")
@@ -1830,6 +1942,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             else:
                 print("  (no evolved cards parsed; deck unchanged)\n")
 
+    transcript_log("request_completed", n_ideas=len(ideas), refined=bool(args.refine))
     return 0
 
 
