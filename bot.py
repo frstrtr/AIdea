@@ -193,12 +193,12 @@ def fmt_usd(n: float) -> str:
 # Rough order-of-magnitude — refined as soon as a few real runs of that mode
 # land in the history.
 _ETA_FALLBACK: dict[str, float] = {
-    "default": 35.0,
-    "einstein": 90.0,
-    "lsd": 65.0,
-    "futures": 90.0,
-    "dream": 40.0,
-    "lucid": 40.0,
+    "default": 80.0,
+    "einstein": 150.0,
+    "lsd": 110.0,
+    "futures": 150.0,
+    "dream": 70.0,
+    "lucid": 70.0,
 }
 
 
