@@ -873,80 +873,137 @@ def build_einstein_prompt(
 # ---------------------------------------------------------------------------
 
 
-LSD_LABEL = "Prior Dissolution"
+LSD_LABEL = "LSD"
+LSD_VALIDATION_LABEL = "LSD (sober validation)"
 
 LSD_PROMPT_TEMPLATE = """\
 The user is working on this problem / question / project:
 
   {topic}
 
-This synthesis uses PRIOR DISSOLUTION. Predictive-processing neuroscience
-(Friston, Seth, Carhart-Harris's REBUS framing of psychedelics) treats
-perception as a controlled hallucination: the brain runs a generative
-model and constructs "reality" from high-level priors plus minimal
-sensory data. Practitioners in any field do the same thing — the way
-they perceive their problem is a learned interpretive frame, not a
-direct view of the situation. Psychedelics interest neuroscientists
-because they relax those high-level priors and let the same raw input
-be re-organized under a different category.
+This synthesis uses LSD MODE — the REBUS framework (RElaxed Beliefs
+Under pSychedelics, Carhart-Harris & Friston). Predictive-processing
+neuroscience treats perception as a controlled hallucination; under
+LSD, the hierarchy of priors FLATTENS. High-precision top-level
+beliefs lose their grip on incoming sensory data. The brain stops
+filtering "noise" as noise. Two mechanical effects drive idea
+generation:
 
-Your job is to suspend the field's interpretive frame and re-organize
-the same underlying situation under a different category. This is NOT:
+  (A) INCREASED GLOBAL CONNECTIVITY. Modules that normally don't
+      exchange signals start handshaking across boundaries —
+      "electrician neurons meet mushroom neurons." This is
+      combinatorial play at the wiring level.
 
-  - inverting a single assumption (that's Productive Error)
-  - borrowing a mechanism from another field (that's Exaptation)
-  - stepping forward through a recently-unlocked door (that's Adjacent
-    Possible)
+  (B) ESCAPE FROM LOCAL MINIMA. Daily expertise and field consensus
+      are deep grooves the brain optimizes inside. LSD raises brain
+      entropy ("shaking the snow globe") — supplying the uphill
+      energy to jump out of one basin of attraction and land in a
+      new conceptual valley.
 
-It is dissolving the silent category the field uses to perceive the
-problem at all, and seeing what becomes obvious without that prior.
+THIS PASS IS THE ANARCHIC PHASE. Error-detection is OFF. Generate
+freely; a separate sober-validation pass will run afterward to check
+what survives. Do not pre-censor.
 
-Donor concepts (raw material; some may resonate, most will not — that
-is expected):
+Donor concepts (sensory flooding — let MANY collide at once; do NOT
+filter for which ones "fit"):
 {seeds}
 
 Process:
-1. Name ONE load-bearing prior the field uses to perceive this problem.
-   A prior is the silent, almost-invisible category-membership the field
-   assigns the problem. Examples in other domains:
-     - "Email is messages between inboxes" (prior: communication is
-       atomic, addressed, durable).
-     - "A car is for getting from A to B" (prior: cars are tools, not
-       experiences).
-     - "Education is content delivery" (prior: knowledge moves from
-       teacher to student).
-   Pick the prior NO ONE in the user's field would think to question.
+1. Name ONE local minimum the user's field is sitting in — the
+   "good-enough" optimum everyone has been improving inside, and the
+   metric the field uses to score moves there.
+2. Force a connection between AT LEAST TWO donor concepts from
+   maximally distant home domains. The handshake should feel weird
+   at first. State the connection plainly.
+3. Loosen at least one normally load-bearing prior — treat it as
+   noise (just as LSD does when the hierarchy flattens). Name which
+   prior you are treating as optional.
+4. Propose an "uphill move" — an idea that gets WORSE on the field's
+   current metric in the short term but, if it works, unlocks a
+   strictly better minimum. The bigger the short-term loss, the
+   sharper the test.
 
-2. Dissolve it. Suspend the category and look at the same raw situation
-   without that frame installed.
-
-3. Re-perceive. The same situation, re-categorized, often makes the
-   problem dissolve, become trivial, or reveal a completely different
-   project. Your idea is what becomes obvious AFTER the prior is gone.
-
-Hard requirements:
-  - The idea must address the user's stated problem, OR show why under
-    the new frame the "problem" disappears (that is a valid output).
-  - It must be executable with technology and resources available today.
-  - It must be specific enough that the user can identify a first step.
+Hard requirements (these alone stay on in the anarchic phase):
+  - The idea must still ADDRESS the user's stated problem (not a
+    tangent — flattened priors does not mean wandering off-topic).
+  - It may sound implausible at first read. That is expected.
+  - The sober-validation pass that follows will check whether the
+    rest of it survives daylight.
 
 Respond in EXACTLY this format, no preamble, no closing remarks:
 
 Title: <3-7 memorable words>
-Mechanism: Prior Dissolution
-The prior being dissolved: <the silent interpretive frame the field uses>
-What the same situation becomes without that prior: <2-3 sentences re-categorizing the situation>
-One-line pitch: <how the idea follows naturally from the new frame>
-How it addresses the request: <2-3 sentences>
-Mechanism (technical): <2-3 sentences on how the re-organization actually works in practice>
-First step the user could take this week: <one concrete action>
-Risks / what could break: <1-2 sentences — especially: what if the original prior was load-bearing for a reason no one ever wrote down>
+Mechanism: LSD (anarchic generation)
+Local minimum being escaped: <the "good-enough" optimum the field's stuck in, plus the metric used to score moves inside it>
+Cross-module connection: <the two distant donor concepts, what handshake they make, why neither alone would have suggested this>
+Loosened prior: <the load-bearing assumption you are treating as noise>
+The uphill move: <2-4 sentences describing the idea — including which direction the field's current metric moves on the short-term scoreboard>
+Why this is hard to see normally: <1-2 sentences — what filter usually suppresses it>
+"""
+
+
+LSD_VALIDATION_PROMPT_TEMPLATE = """\
+You are the sober inference engine running a 24-hours-later validation
+pass on an idea generated under LSD MODE (anarchic, error-detection
+offline). High-precision priors are back online. Your job is the
+OPPOSITE of generation: filter what survives, name what was
+hallucination, and produce the buildable v0.1.
+
+User topic:
+  {topic}
+
+Anarchic idea (generated with relaxed beliefs):
+
+{anarchic_idea}
+
+Process:
+1. Identify the structural insight the anarchic mind got right —
+   something a sober planner would have missed because it sits below
+   the threshold of "obviously feasible." Be honest: name it even if
+   the delivery is wild.
+2. Identify what was hallucination — claims that don't hold up to
+   physics, economics, regulation, user behavior, or basic
+   arithmetic. Name them specifically, not vaguely.
+3. Propose the corrected v0.1 — the version that RETAINS the
+   structural insight from (1) but is shippable today by a small
+   team. If the insight cannot be retained without the hallucination,
+   say so plainly.
+
+Respond in EXACTLY this format, no preamble:
+
+Mechanism: LSD (sober validation)
+What survives the morning: <1-2 sentences naming the structural insight worth keeping>
+What was hallucination: <1-2 sentences naming the parts that don't hold and WHY>
+The corrected v0.1: <2-4 sentences — the buildable version>
+First step the user could take this week: <one concrete action> OR the literal phrase "(none — the insight does not survive sober checking)"
+Risks / what could still break: <1-2 sentences>
 """
 
 
 def build_lsd_prompt(topic: str, cards: list[Card]) -> str:
     seeds = "\n".join(card.render() for card in cards)
     return LSD_PROMPT_TEMPLATE.format(topic=topic.strip(), seeds=seeds)
+
+
+async def lsd_validate(
+    topic: str,
+    anarchic_idea: str,
+    model: str,
+) -> str:
+    """Run the sober validation pass on an LSD-mode anarchic idea.
+
+    Two-stage faithfulness to the REBUS framing: the anarchic phase
+    above generates with error-detection offline; this phase brings
+    high-precision priors back online and filters what survives. Logs
+    as kind='lsd_validate' for transcript/usage tracking.
+    """
+    prompt = LSD_VALIDATION_PROMPT_TEMPLATE.format(
+        topic=topic.strip(),
+        anarchic_idea=anarchic_idea.strip(),
+    )
+    return await _query_text(
+        prompt, SYNTHESIZER_SYSTEM, model, kind="lsd_validate",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2171,18 +2228,29 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 model=args.model,
                 stream_to_stdout=not args.quiet,
             )
-            ideas.append(idea)
-            mechanisms_used.append(LSD_LABEL)
-            cards_per_idea.append(cards)
             transcript_log(
-                "idea", i=i,
-                mechanism=mechanisms_used[-1],
-                text=idea,
+                "idea", i=i, mechanism=LSD_LABEL, text=idea,
                 cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in cards],
             )
-
             if args.quiet:
                 print(idea)
+
+            # Sober-validation pass — error detection back online.
+            print(
+                "\n=== Sober validation (LSD pass "
+                f"{i + 1}/{args.n_ideas}) ===\n"
+            )
+            sober = await lsd_validate(args.topic, idea, args.model)
+            print(sober)
+            transcript_log(
+                "lsd_validation", i=i, anarchic=idea, sober=sober,
+            )
+
+            # The sober version is what we keep for downstream critic /
+            # refine — it's the one that survived priors coming back online.
+            ideas.append(sober)
+            mechanisms_used.append(LSD_VALIDATION_LABEL)
+            cards_per_idea.append(cards)
     elif args.einstein:
         # One pass per mechanism, all sharing the entropy-controlled card draw.
         mech_keys = list(EINSTEIN_MECHANISMS.keys())

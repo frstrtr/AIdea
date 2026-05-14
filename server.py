@@ -37,6 +37,7 @@ from aidea import (
     FUTURES_HORIZONS,
     FUTURES_HORIZONS_BY_KEY,
     LSD_LABEL,
+    LSD_VALIDATION_LABEL,
     LUCID_LABEL,
     Card,
     build_dream_prompt,
@@ -50,6 +51,7 @@ from aidea import (
     evolve_cards,
     load_bank,
     load_or_generate_deck,
+    lsd_validate,
     merge_evolved_into_deck,
     parse_entropy,
     refine_idea,
@@ -361,9 +363,7 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             return
         assert idea is not None
 
-        ideas.append(idea)
-        mechanism_labels.append(mech_label)
-        cards_per_idea.append(cards)
+        # Emit the anarchic idea (visible to the user even before sober pass).
         yield _sse("idea", {
             "i": i,
             "text": idea,
@@ -375,6 +375,48 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             text=idea,
             cards=[_card_to_dict(c) for c in cards],
         )
+
+        # LSD has a mandatory second pass: sober validation. Anything else
+        # (default / einstein / futures / dream / lucid) emits the idea as-is.
+        if mode == "lsd":
+            validate_phase = f"lsd-validate-{i}"
+            yield _sse("status", {
+                "phase": validate_phase,
+                "i": i,
+                "message": (
+                    f"Sober validation pass {i + 1}/{len(passes)} — priors "
+                    "back online; filtering what survives..."
+                ),
+            })
+            sober: str | None = None
+            try:
+                async for kind, payload in _watched(
+                    lsd_validate(req.topic, idea, req.model),
+                    phase=validate_phase,
+                ):
+                    if kind == "progress":
+                        yield _sse("progress", payload)
+                    else:
+                        sober = payload
+            except Exception as e:
+                yield _sse("error", {"message": f"lsd validation failed: {e}"})
+                return
+            assert sober is not None
+            yield _sse("lsd_validation", {
+                "i": i,
+                "anarchic": idea,
+                "sober": sober,
+            })
+            transcript_log(
+                "lsd_validation", i=i, anarchic=idea, sober=sober,
+            )
+            # Use the sober version downstream (critic/refine sees this).
+            ideas.append(sober)
+            mechanism_labels.append(LSD_VALIDATION_LABEL)
+        else:
+            ideas.append(idea)
+            mechanism_labels.append(mech_label)
+        cards_per_idea.append(cards)
 
     # --- Stage 3: critic + refinement (optional) --------------------------
     if req.refine and ideas:
@@ -721,6 +763,13 @@ INDEX_HTML = r"""<!doctype html>
   .winner-banner { background: #fff8c2; border-left: 3px solid #b59500;
                    padding: 0.45rem 0.7rem; font-weight: 600;
                    font-size: 0.95rem; border-radius: 0 4px 4px 0; }
+  .meta.lsd-sober-meta { color: #5a6ad6; font-weight: 600; letter-spacing: 0.05em;
+                         text-transform: uppercase; }
+  .idea.lsd-sober { border-left: 4px solid #5a6ad6; background: #f5f6fb; }
+  @media (prefers-color-scheme: dark) {
+    .meta.lsd-sober-meta { color: #93a4ff; }
+    .idea.lsd-sober { background: #0f1129; border-left-color: #93a4ff; }
+  }
   .idea.refined { border-left-width: 4px; border-left-color: #1a8a4f;
                   background: #f4faf6; }
   @media (prefers-color-scheme: dark) {
@@ -1010,7 +1059,7 @@ function handleEvent(chunk) {
     const cardHtml = obj.cards.map(renderCard).join('');
     const mechTag = obj.mechanism
       ? '<span class="mech-tag' + (
-          obj.mechanism === 'Prior Dissolution' ? ' lsd' :
+          obj.mechanism && obj.mechanism.indexOf('LSD') === 0 ? ' lsd' :
           obj.mechanism === 'Dreaming' ? ' dream' :
           obj.mechanism === 'Lucid Dreaming' ? ' lucid' :
           obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' :
@@ -1032,7 +1081,7 @@ function handleEvent(chunk) {
     finishStatus('synth-' + obj.i, 'idea ' + (obj.i + 1) + ' ready');
     const mechTag = obj.mechanism
       ? '<span class="mech-tag' + (
-          obj.mechanism === 'Prior Dissolution' ? ' lsd' :
+          obj.mechanism && obj.mechanism.indexOf('LSD') === 0 ? ' lsd' :
           obj.mechanism === 'Dreaming' ? ' dream' :
           obj.mechanism === 'Lucid Dreaming' ? ' lucid' :
           obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' :
@@ -1043,12 +1092,18 @@ function handleEvent(chunk) {
       '<div class="meta">Idea ' + (obj.i + 1) + mechTag + '</div>' +
       '<div class="idea"><pre>' + escapeHtml(obj.text) + '</pre></div>'
     );
+  } else if (event === 'lsd_validation') {
+    finishStatus('lsd-validate-' + obj.i, 'sober validation ' + (obj.i + 1) + ' done');
+    addPanel(
+      '<div class="meta lsd-sober-meta">LSD · sober validation ' + (obj.i + 1) + '</div>' +
+      '<div class="idea lsd-sober"><pre>' + escapeHtml(obj.sober) + '</pre></div>'
+    );
   } else if (event === 'score') {
     finishStatus('critic-' + obj.i,
                  'idea ' + (obj.i + 1) + ' scored ' + obj.total + '/300');
     const mechTag = obj.mechanism
       ? '<span class="mech-tag' + (
-          obj.mechanism === 'Prior Dissolution' ? ' lsd' :
+          obj.mechanism && obj.mechanism.indexOf('LSD') === 0 ? ' lsd' :
           obj.mechanism === 'Dreaming' ? ' dream' :
           obj.mechanism === 'Lucid Dreaming' ? ' lucid' :
           obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' :

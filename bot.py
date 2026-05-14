@@ -54,11 +54,13 @@ from aidea import (
     EINSTEIN_MECHANISMS,
     FUTURES_HORIZONS,
     LSD_LABEL,
+    LSD_VALIDATION_LABEL,
     LUCID_LABEL,
     build_dream_prompt,
     build_einstein_prompt,
     build_futures_prompt,
     build_lsd_prompt,
+    lsd_validate,
     build_lucid_prompt,
     build_prompt,
     critic_score,
@@ -365,9 +367,6 @@ async def run_pipeline_for_telegram(
                 update=update, context=context, cancel=state.cancel,
                 headline=f"synthesizing {label_for_user}",
             )
-            ideas.append(idea)
-            cards_per_idea.append(drawn)
-            mech_labels.append(label)
             transcript_log(
                 "idea", i=i, mechanism=label, text=idea,
                 cards=[{k: v for k, v in c.__dict__.items() if v is not None} for c in drawn],
@@ -378,6 +377,31 @@ async def run_pipeline_for_telegram(
                 (f" — {label}" if label else "")
             )
             await send_idea(update, context, header, idea)
+
+            if m == "lsd":
+                # Sober validation pass: priors back online, separate
+                # insight from hallucination. The sober version is what
+                # we keep for downstream critic / refine.
+                sober = await run_with_progress(
+                    lsd_validate(topic, idea, s.model),
+                    update=update, context=context, cancel=state.cancel,
+                    headline=f"sober validation {i + 1}",
+                )
+                transcript_log(
+                    "lsd_validation", i=i, anarchic=idea, sober=sober,
+                )
+                await send_idea(
+                    update, context,
+                    f"Sober validation {i + 1} (priors online)",
+                    sober,
+                )
+                ideas.append(sober)
+                cards_per_idea.append(drawn)
+                mech_labels.append(LSD_VALIDATION_LABEL)
+            else:
+                ideas.append(idea)
+                cards_per_idea.append(drawn)
+                mech_labels.append(label)
 
         # Stage 3: critic + refine
         if s.refine and ideas:
