@@ -1063,11 +1063,90 @@ async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🛑 Cancel signalled.")
 
 
+# Plain greetings and ack-fillers that should NOT trigger a full ideation
+# pipeline — users who send these usually don't know what the bot does and
+# are paying us (and themselves) ~3 min + ~$0.05 of subscription tokens
+# for a forced "idea about saying hi" answer. Catch them at the door and
+# explain instead.
+_GREETING_WORDS = {
+    # ru
+    "привет", "приветик", "здравствуй", "здравствуйте", "хай", "ку",
+    "хей", "доброе утро", "добрый день", "добрый вечер", "ку-ку",
+    "здарова", "здаров", "хелло", "йо",
+    # en
+    "hi", "hello", "hey", "yo", "sup", "howdy", "good morning",
+    "good evening", "good afternoon",
+    # other common
+    "salut", "bonjour", "hola", "ciao",
+}
+
+
+def _looks_like_idle_chat(text: str) -> bool:
+    """True if the message is plainly a greeting / ack / too-short to be a
+    real ideation task. Conservative — false-negatives (let through) are
+    cheaper than false-positives (lecture a real user)."""
+    t = text.strip().lower().rstrip(".!?…,)(:;")
+    if not t:
+        return True
+    if t in _GREETING_WORDS:
+        return True
+    # Very short non-questions are almost certainly chat, not a task.
+    # Keep the bar low so things like "куда поехать?" or "what now?" still
+    # go through.
+    if len(t) < 8 and "?" not in text:
+        return True
+    return False
+
+
+def _looks_russian(text: str) -> bool:
+    """Cheap script-based language detection. We only need RU vs anything-else
+    for the welcome message — the synthesizer's own LANGUAGE_RULE handles the
+    rest of the conversation."""
+    cyr = sum(1 for ch in text if "Ѐ" <= ch <= "ӿ")
+    lat = sum(1 for ch in text if ("a" <= ch <= "z") or ("A" <= ch <= "Z"))
+    return cyr > lat
+
+
+_WELCOME_RU = (
+    "Привет 👋\n\n"
+    "Я генерирую *неожиданные, но выполнимые* идеи под вашу конкретную задачу.\n\n"
+    "Просто напишите мне свою задачу, проблему или вопрос одной-двумя "
+    "фразами — и я через 2–3 минуты пришлю 3 разных идеи с конкретным "
+    "первым шагом и примером, где похожий механизм уже сработал.\n\n"
+    "Примеры:\n"
+    "  • Как развивать персональный сайт эксперта по управлению бизнесом?\n"
+    "  • Что приготовить на ужин за 15 минут?\n"
+    "  • Придумай новую технологию кроссовок\n\n"
+    "Команды:\n"
+    "  /help — все режимы и настройки\n"
+    "  /einstein /lsd /futures /dream /lucid — другие режимы генерации"
+)
+
+_WELCOME_EN = (
+    "Hi 👋\n\n"
+    "I generate *unexpected-but-doable* ideas for your specific problem.\n\n"
+    "Just send your task, problem, or question in a sentence or two — "
+    "in 2–3 minutes I'll reply with 3 different ideas, each with a "
+    "concrete first step and a real example where a similar mechanism "
+    "has worked elsewhere.\n\n"
+    "Examples:\n"
+    "  • How to develop a personal site for a business consultant?\n"
+    "  • What can I cook for dinner in 15 minutes?\n"
+    "  • Invent a new sneaker technology\n\n"
+    "Commands:\n"
+    "  /help — all modes and settings\n"
+    "  /einstein /lsd /futures /dream /lucid — other generation modes"
+)
+
+
 async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Treat any non-command text message as a default /idea request."""
+    """Treat any non-command text message as a default /idea request — unless
+    it's plainly a greeting or empty ping, in which case explain what the
+    bot does instead of burning a pipeline on it."""
     topic = (update.message.text or "").strip()
-    if not topic:
-        await update.message.reply_text(HELP_TEXT)
+    if _looks_like_idle_chat(topic):
+        welcome = _WELCOME_RU if _looks_russian(topic) else _WELCOME_EN
+        await update.message.reply_text(welcome)
         return
     await run_pipeline_for_telegram(
         update=update, context=ctx, topic=topic, mode="default",
