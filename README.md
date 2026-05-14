@@ -129,6 +129,132 @@ The five are mutually exclusive. Web UI exposes them as checkboxes + a
 prior textarea. Telegram exposes them as `/einstein`, `/lsd`, `/futures`,
 `/dream`, `/lucid <prior> :: <topic>`.
 
+## Scientific basis per mode
+
+Each mode is a cognitive operation borrowed from a specific framework in
+neuroscience / cognitive science / philosophy of invention. The prompt
+templates implement these mechanisms verbatim — the model is not asked
+to "be creative"; it is asked to execute a named process from the
+literature.
+
+### Overarching frame
+
+The pipeline implements **stochastic synthesis** as described by
+Stuart Kauffman and popularized by Steven Johnson:
+
+- **Adjacent Possible** (Kauffman, *Investigations*, 2000) — at any moment
+  the set of "next-door rooms" is bounded by prior work. Discovery walks
+  through doors that have just been unlocked.
+- **Conceptual blending** (Fauconnier & Turner, *The Way We Think*, 2002) —
+  novel ideas come from forced cross-domain combination, not from raw
+  invention. "Originality" is a high-entropy reorganization of low-entropy
+  data.
+
+Entropy lives at the *raw material* layer (which donor concepts collide).
+Inference lives at the *synthesis* layer (the model finds the structural
+overlap). The two are kept orthogonal, which mirrors how the brain seems
+to separate *combinatorial play* (the Default Mode Network during rest)
+from *evaluation* (executive function when awake).
+
+### `default` — applied conceptual blending
+
+| | |
+|---|---|
+| **What it does** | One idea per call at the requested entropy. Standard format: title, pitch, mechanism, first step, risks. |
+| **Cognitive model** | Conceptual blending under feasibility constraint. Picks 1+ donor concepts whose structural mechanism transfers onto the user's topic. |
+| **Sources** | Fauconnier & Turner (*The Way We Think*, 2002); Kauffman (*Investigations*, 2000). |
+| **When to use** | First-look on any topic; baseline for comparing the other modes. |
+
+### `einstein` — four generative mechanisms
+
+Runs four passes in series, each implementing one of the four routes-to-
+ideas catalogued by Steven Johnson in *Where Good Ideas Come From* (2010):
+
+1. **Adjacent Possible** (Kauffman 2000 / Johnson 2010) — name a
+   capability that became available in the last 1-3 years, walk through
+   that newly-unlocked door.
+2. **Exaptation** (Gould & Vrba, "Exaptation — a missing term in the
+   science of form", *Paleobiology* 1982) — biological term for a trait
+   that evolved for one purpose then got co-opted for another. Applied to
+   ideation: transplant a mechanism from a far-distant field. (Gutenberg
+   moving the wine-press mechanism to inked type is the canonical
+   example.)
+3. **Slow Hunch** (Johnson 2010) — articulate a latent tension or quiet
+   contradiction the field has lived with for years without naming
+   cleanly, then propose its resolution.
+4. **Productive Error** (Fleming 1928 / mutation as evolutionary engine)
+   — invert one load-bearing assumption the field treats as fixed.
+   Misreadings that survive contact with reality become discoveries.
+
+Combine with `refine` to score across mechanisms and harden the winning
+route — gives empirical signal on *which route works for your topic*.
+
+### `lsd` — REBUS, two-pass (anarchic generation + sober validation)
+
+| | |
+|---|---|
+| **What it does** | Two LLM calls per pass: an anarchic generation with priors relaxed and error-detection offline, followed by a sober validation pass with priors restored. The sober output is what enters downstream refine. |
+| **Cognitive model** | **REBUS** — RElaxed Beliefs Under pSychedelics. Predictive-processing neuroscience treats perception as a controlled hallucination held in check by high-precision priors; psychedelics (especially LSD, via 5-HT2A receptor agonism in deep cortical layers) flatten the hierarchy, weaken those priors, and increase brain entropy. |
+| **Mechanism** | Anarchic prompt forces (a) naming the local minimum the field is stuck in, (b) listing 2-3 load-bearing priors to treat as noise, (c) a cross-module connection between maximally distant donor concepts, (d) an "uphill move" that gets worse on the current metric short-term. Validation prompt brings error detection back online and asks the model to separate the structural insight from the hallucination. |
+| **Sources** | Carhart-Harris & Friston, "REBUS and the Anarchic Brain: Toward a Unified Model of the Brain Action of Psychedelics", *Pharmacological Reviews* 2019. Anil Seth, *Being You: A New Science of Consciousness*, 2021. Karl Friston, "The free-energy principle: a unified brain theory?", *Nature Reviews Neuroscience* 2010. |
+| **When to use** | When you suspect you're stuck inside a "good-enough" local minimum and need to escape it — at the cost of 2× the LLM calls per pass. The pro-tip from the literature: "Best psychedelic breakthroughs are when the anarchic brain generates the connection and the sober inference engine validates it 24 hours later." This is implemented as the two-pass structure. |
+
+### `futures` — temporal projection at four horizons
+
+| | |
+|---|---|
+| **What it does** | Four passes at +1y / +3y / +10y / +30y. Each names three concrete shifts at that horizon, identifies what's obvious from there but invisible today, then translates to a v0.1 you can ship this year. |
+| **Cognitive model** | The brain runs ~100ms behind the world and compensates by hallucinating the immediate future (perceptual forward-modeling). This mode runs the same forward-simulation operation at much longer horizons. Wright-brothers vantage point: see the airplane from 1910, build it in 1903. |
+| **Sources** | Anil Seth, *Being You*, 2021 (the 100ms-delayed-past framing). Foresight methodology: Pierre Wack at Royal Dutch Shell, 1970s (scenario planning); Stewart Brand, *The Clock of the Long Now*, 1999. |
+| **When to use** | When the field is about to inflect and you want to ship the v0.1 of something that's obvious from 2035 but invisible from 2026. |
+
+### `dream` — unconstrained generative (feasibility OFF)
+
+| | |
+|---|---|
+| **What it does** | One pass per `n_ideas`. The prediction-error signal is offline; the generative model runs without external correction. Output is a "dream image" that may violate physics / economics / regulation, followed by a "what survives waking" line naming the salvageable fragment. |
+| **Cognitive model** | Sleep-state cognition under predictive processing. Friston: dreams are *complexity reduction* — the brain replaying the day's data with the prediction-error mechanism disabled so it can test connections that would have been rejected as too high-error in waking life. Dreams as **synaptic garbage collection** (Friston 2010) and as **invention labs** (the structure of benzene, the periodic table, the sewing machine — all examples of dream-state recombination yielding waking-state insight). |
+| **Sources** | Friston, "The free-energy principle: a unified brain theory?", *Nature Reviews Neuroscience* 2010. Hobson & Friston, "Waking and dreaming consciousness: Neurobiological and functional considerations", *Progress in Neurobiology* 2012. Activation-synthesis hypothesis (J. Allan Hobson, 1970s). Stickgold on memory consolidation in REM sleep. |
+| **When to use** | When you want to escape the gravity of current practice entirely. Output looks wild on first read — the value is in the "what survives waking" line, the way real dream-insight only resolves after the priors come back. |
+
+### `lucid` — hybrid: dream + injected prior
+
+| | |
+|---|---|
+| **What it does** | Same dream-state generation, but you inject a directional prior the hallucination must bias toward. One explicit reality check fires before waking. |
+| **Cognitive model** | Lucid dreaming as a hybrid state: prefrontal metacognition is online (the dreamer knows they are dreaming) while the rest of the brain remains in the generative, prediction-error-suppressed mode. The dreamer can then *inject high-confidence priors* into the running model — wanting to fly biases "upward motion" toward the high-confidence state rather than fighting gravity. |
+| **Sources** | Stephen LaBerge, *Exploring the World of Lucid Dreaming*, 1990 (Stanford lucid-dream research). Voss, Holzmann, Tuin & Hobson, "Lucid dreaming: a state of consciousness with features of both waking and non-lucid dreaming", *Sleep* 2009 (gamma-band activity findings). |
+| **When to use** | When you want the wild combinatorial reach of dream-mode but with a steering input — "stay solo-founder-sized", "free version must remain genuinely free", "no recruiters". The prior anchors the hallucination, so more salvage survives waking than pure `dream`. |
+
+### Entropy levels — Carhart-Harris's Entropic Brain hypothesis
+
+The named entropy levels (`sane / wild / insane / crazy / mad`) parametrize
+*how high-precision the field's priors should be treated as*, on the
+spectrum Carhart-Harris describes in "The Entropic Brain" (*Frontiers in
+Human Neuroscience* 2014). Low entropy = priors precise = constrained
+inference = standard practice. High entropy = priors weak = expanded
+search space = REBUS-like state. The `mad` level is not implemented by
+asking for higher temperature — it is implemented by explicitly
+instructing the model to *treat one prior as noise*, then ship anyway.
+This is the structural translation of the Entropic Brain framework into
+a prompt.
+
+### Refine + Evolve-Deck — Bayesian updating across runs
+
+The `refine` flag is **Bayesian model selection**: after generating N
+ideas, score each on three independent axes (feasibility / unexpectedness
+/ topic-fit), select the maximum posterior, then re-prompt at a tighter
+prior. This is the "sober validation" step the LSD literature names as
+the second half of psychedelic-assisted insight.
+
+The `evolve_deck` flag implements **memory consolidation** in the
+Loftus / reconstructive-memory sense (Elizabeth Loftus, decades of work
+on memory as a Read/Write process). When a card contributes to a
+winning idea, the card itself is rewritten to better carry the
+structural insight that worked. The deck becomes a learning artifact
+across sessions — closer to how the brain actually represents
+experience (reconstructed each time, not retrieved verbatim).
+
 ## Theme generator
 
 The donor-domain list is **LLM-generated per request**, biased by entropy

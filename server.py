@@ -780,6 +780,38 @@ INDEX_HTML = r"""<!doctype html>
     .idea { background: #111; border-left-color: #e5e5e5; }
     .idea.refined { background: #0f1a13; border-left-color: #3acb78; }
     .meta.refined-meta { color: #3acb78; }
+  }
+  details.modes-legend { margin-bottom: 1.2rem; }
+  details.modes-legend > summary {
+    cursor: pointer; font-weight: 600; padding: 0.4rem 0;
+    color: var(--fg, #1a1a1a);
+  }
+  details.modes-legend table {
+    width: 100%; border-collapse: collapse; margin-top: 0.6rem;
+    font-size: 0.92rem;
+  }
+  details.modes-legend th,
+  details.modes-legend td {
+    text-align: left; vertical-align: top;
+    padding: 0.55rem 0.7rem;
+    border-top: 1px solid #eaeaea;
+  }
+  details.modes-legend th {
+    font-size: 0.78rem; letter-spacing: 0.05em;
+    text-transform: uppercase; color: #888;
+    border-top: none;
+  }
+  details.modes-legend td:first-child { width: 8rem; }
+  details.modes-legend code { font-size: 0.92em; }
+  .legend-cite {
+    margin-top: 0.4rem; padding-top: 0.35rem;
+    border-top: 1px dashed #eaeaea;
+    color: #888; font-size: 0.82rem; font-style: italic;
+  }
+  @media (prefers-color-scheme: dark) {
+    details.modes-legend th,
+    details.modes-legend td { border-top-color: #2a2a2a; }
+    .legend-cite { border-top-color: #2a2a2a; color: #999; }
     .sub, .status, summary, .card .domain, .critic-notes { color: #aaa; }
     .score-pill { background: #2a2a2a; color: #ddd; }
     .score-pill.total { background: #e5e5e5; color: #1a1a1a; }
@@ -802,12 +834,50 @@ INDEX_HTML = r"""<!doctype html>
   <summary>Modes — pick at most one</summary>
   <table>
     <tr><th>Mode</th><th>What it does</th></tr>
-    <tr><td><code>default</code></td><td>Generate <code>n_ideas</code> ideas at the requested entropy. Standard applied-ideas pass with feasibility-required output.</td></tr>
-    <tr><td><code>Einstein</code></td><td>Four passes, one per mechanism: <b>Adjacent Possible</b> (next door unlocked) · <b>Exaptation</b> (transplant a mechanism from another field) · <b>Slow Hunch</b> (latent tension resolved) · <b>Productive Error</b> (invert a load-bearing assumption).</td></tr>
-    <tr><td><code>LSD</code></td><td><b>Prior Dissolution</b> — predictive-processing framing. Suspend the field's interpretive prior and re-perceive under a different category. Different from inverting one assumption.</td></tr>
-    <tr><td><code>Futures</code></td><td>Four temporal horizons (+1y / +3y / +10y / +30y). Identify what's obvious from each future, ship the v0.1 today.</td></tr>
-    <tr><td><code>Dream</code></td><td>Dreaming mode — prediction-error offline. Generative model runs free, <b>no feasibility constraint</b>. Output is a dream image + "what survives waking" interpretation.</td></tr>
-    <tr><td><code>Lucid</code></td><td>Lucid dreaming — dream with a directional prior you inject. Hallucination biases toward your prior; one reality check at the end. More salvage than pure dream.</td></tr>
+    <tr><td><code>default</code></td><td>
+      Applied conceptual blending. Generate <code>n_ideas</code> ideas at
+      the requested entropy. Picks 1+ donor concepts whose structural
+      mechanism transfers onto your topic. Feasibility required.
+      <div class="legend-cite">Fauconnier &amp; Turner, <i>The Way We Think</i> (2002); Kauffman, <i>Investigations</i> (2000).</div>
+    </td></tr>
+    <tr><td><code>Einstein</code></td><td>
+      Four passes, one per generative mechanism Steven Johnson catalogues
+      in <i>Where Good Ideas Come From</i> (2010):
+      <b>Adjacent Possible</b> (Kauffman 2000 — walk through a just-unlocked door),
+      <b>Exaptation</b> (Gould &amp; Vrba, <i>Paleobiology</i> 1982 — transplant a mechanism from a far-distant field),
+      <b>Slow Hunch</b> (Johnson 2010 — articulate a latent tension),
+      <b>Productive Error</b> (Fleming 1928 — invert a load-bearing assumption).
+      <div class="legend-cite">Johnson, <i>Where Good Ideas Come From</i> (2010).</div>
+    </td></tr>
+    <tr><td><code>LSD</code></td><td>
+      TWO passes per idea: <b>anarchic generation</b> (priors relaxed,
+      error-detection OFF — flatten hierarchy, force cross-module
+      connections, propose an "uphill move"), then <b>sober validation</b>
+      (priors back online; separate insight from hallucination, propose a
+      buildable v0.1). The sober output is what enters downstream refine.
+      <div class="legend-cite">Carhart-Harris &amp; Friston, "REBUS and the Anarchic Brain", <i>Pharmacological Reviews</i> (2019); Seth, <i>Being You</i> (2021); Friston, "Free-energy principle", <i>Nature Reviews Neuroscience</i> (2010).</div>
+    </td></tr>
+    <tr><td><code>Futures</code></td><td>
+      Four temporal horizons (+1y / +3y / +10y / +30y). Each names three
+      concrete shifts at that horizon, identifies what is obvious from
+      there but invisible today, then translates to a v0.1 shippable
+      this year. The Wright-brothers vantage point.
+      <div class="legend-cite">Seth, <i>Being You</i> (2021) — the brain's ~100ms perceptual forward-modeling. Foresight lineage: Wack at Shell (1970s); Brand, <i>The Clock of the Long Now</i> (1999).</div>
+    </td></tr>
+    <tr><td><code>Dream</code></td><td>
+      Prediction-error signal offline. Generative model runs free with
+      <b>NO feasibility constraint</b>. Output: vivid dream image that
+      may violate physics / economics / regulation, plus an explicit
+      "what survives waking" line naming the salvageable fragment.
+      <div class="legend-cite">Friston, "Free-energy principle" (2010) — dreams as complexity reduction / synaptic garbage collection. Hobson &amp; Friston, "Waking and dreaming consciousness", <i>Progress in Neurobiology</i> (2012).</div>
+    </td></tr>
+    <tr><td><code>Lucid</code></td><td>
+      Hybrid: dream-state generation + a directional prior you inject.
+      The hallucination biases toward your prior; one reality check fires
+      before waking. More salvage than pure Dream because the prior
+      anchors the hallucination.
+      <div class="legend-cite">LaBerge, <i>Exploring the World of Lucid Dreaming</i> (1990); Voss et al., "Lucid dreaming: a state of consciousness with features of both waking and non-lucid dreaming", <i>Sleep</i> (2009).</div>
+    </td></tr>
   </table>
   <p><b>Flags:</b> <code>refine</code> = score every idea, pick winner, harden it. <code>evolve_deck</code> = after refine, sharpen winning cards back into the deck cache. <code>theme_entropy</code> = how distant the auto-generated donor domains should be (0 = in-field; 1 = wildly distant).</p>
 </details>
