@@ -607,24 +607,35 @@ async def generate_deck(
     # problem space, scoped per-source for privacy. The synthesizer never
     # sees retrieval — only the deck-gen prompt does — so the entropy
     # mechanism stays clean.
+    #
+    # AIDEA_RAG_DISABLE=1 short-circuits retrieval entirely (pure-entropy
+    # mode). The corpus still accumulates from this run via ingest_deck,
+    # so toggling the flag back on later resumes the flywheel without
+    # data loss. Used to A/B test whether the quality-boosted warm-start
+    # is actually helping or just amplifying past winners into unrelated
+    # topics.
     warm_block = ""
-    try:
-        from rag import retrieve_similar, render_warm_start
-        from transcripts import current_source
-        src = current_source() or "unknown"
-        retrieved = retrieve_similar(source=src, topic=topic, k=8)
-        warm_block = render_warm_start(retrieved)
-        if verbose and retrieved:
-            names = ", ".join(
-                (r.get("card") or {}).get("name", "?") for r in retrieved[:5]
-            )
-            print(
-                f"[deck] warm-start from corpus: {len(retrieved)} card(s) — "
-                f"{names}{'...' if len(retrieved) > 5 else ''}",
-                flush=True,
-            )
-    except Exception:
-        warm_block = ""
+    if os.environ.get("AIDEA_RAG_DISABLE", "").strip() not in ("", "0", "false", "False"):
+        if verbose:
+            print("[deck] AIDEA_RAG_DISABLE set — pure-entropy mode (no warm start)", flush=True)
+    else:
+        try:
+            from rag import retrieve_similar, render_warm_start
+            from transcripts import current_source
+            src = current_source() or "unknown"
+            retrieved = retrieve_similar(source=src, topic=topic, k=8)
+            warm_block = render_warm_start(retrieved)
+            if verbose and retrieved:
+                names = ", ".join(
+                    (r.get("card") or {}).get("name", "?") for r in retrieved[:5]
+                )
+                print(
+                    f"[deck] warm-start from corpus: {len(retrieved)} card(s) — "
+                    f"{names}{'...' if len(retrieved) > 5 else ''}",
+                    flush=True,
+                )
+        except Exception:
+            warm_block = ""
 
     prompt = _deck_gen_prompt(
         topic, n, depth, themes=themes or None, warm_start=warm_block,
