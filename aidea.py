@@ -764,6 +764,143 @@ def build_lsd_prompt(topic: str, cards: list[Card]) -> str:
     return LSD_PROMPT_TEMPLATE.format(topic=topic.strip(), seeds=seeds)
 
 
+# ---------------------------------------------------------------------------
+# Futures Mode: predictive-processing framing taken seriously. The brain
+# compensates for its ~100ms perceptual delay by hallucinating the immediate
+# future. This mode runs that forward simulation for the user's field at a
+# specific horizon and asks what idea is OBVIOUS from there but invisible
+# from today. Then translates it back to a v0.1 the user can ship now.
+# ---------------------------------------------------------------------------
+
+
+FUTURES_LABEL = "Futures Projection"
+
+
+FUTURES_HORIZONS: list[dict[str, str]] = [
+    {
+        "key": "1y",
+        "label": "Futures · +1 year",
+        "horizon_name": "1 year from now",
+        "framing": (
+            "Trends already in motion; what is now in pilot becomes the "
+            "default. Low-confidence step, low risk. The job is to spot "
+            "what is about to be obvious that the field is still calling "
+            "an early-adopter quirk."
+        ),
+    },
+    {
+        "key": "3y",
+        "label": "Futures · +3 years",
+        "horizon_name": "3 years from now",
+        "framing": (
+            "What is currently rare-but-validated becomes commodity. The "
+            "first big incumbent loses ground or dies. Costs collapse on "
+            "things people still treat as expensive today."
+        ),
+    },
+    {
+        "key": "10y",
+        "label": "Futures · +10 years",
+        "horizon_name": "10 years from now",
+        "framing": (
+            "Structural shifts visible only in today's early-adopter "
+            "cohorts have become the default for everyone. Today's "
+            "fringe is tomorrow's mainstream. Whole job categories "
+            "appear or vanish."
+        ),
+    },
+    {
+        "key": "30y",
+        "label": "Futures · +30 years",
+        "horizon_name": "30 years from now",
+        "framing": (
+            "Regime change. The frame everyone uses to think about this "
+            "field today is gone — and would sound naive to a "
+            "practitioner from then. The Wright-brothers vantage point: "
+            "what is obvious only from a future that hasn't been built "
+            "yet."
+        ),
+    },
+]
+
+FUTURES_HORIZONS_BY_KEY = {h["key"]: h for h in FUTURES_HORIZONS}
+
+
+FUTURES_PROMPT_TEMPLATE = """\
+The user is working on this problem / question / project:
+
+  {topic}
+
+This synthesis uses TEMPORAL PROJECTION. The brain compensates for its
+~100ms perceptual delay by hallucinating the immediate future — running
+forward simulations off the current model. This mode runs that forward
+simulation for the user's field at a specific horizon and asks what idea
+is OBVIOUS from there but invisible from today.
+
+Your horizon: {horizon_name}.
+Framing for that horizon: {framing}
+
+Donor concepts (raw material; use them to widen your forecast, not to
+constrain it):
+{seeds}
+
+Process:
+1. Simulate the user's field at {horizon_name}. Name three concrete
+   shifts that are likely by then: a capability, a constraint, and a
+   behavior change. Be specific — name technologies, regulations, user
+   habits, cost curves — not adjectives. If you cannot name them, your
+   forecast is too vague; tighten it.
+2. From that vantage point, identify ONE idea that is OBVIOUS at the
+   horizon but invisible (or laughable, or "impossible") from today.
+   The Wright brothers in 1900 could see "people fly between cities";
+   the world in 1900 said "impossible".
+3. Translate it back to NOW. What is the v0.1 a small team could ship
+   THIS YEAR that walks toward that obvious-from-the-future idea? The
+   v0.1 must be feasible with today's tools even if the full version is
+   years away.
+
+Hard requirements:
+  - The v0.1 must be executable today with current technology.
+  - It must be specific enough that the user can identify a first step
+    to try this week.
+  - The "three shifts" must each be concrete and defensible — not
+    "AI gets better".
+
+Respond in EXACTLY this format, no preamble:
+
+Title: <3-7 memorable words>
+Mechanism: Futures Projection
+Horizon: {horizon_name}
+Three shifts by then: <three concrete near-certain shifts: capability, constraint, behavior>
+What is obvious from there: <2-3 sentences on the idea visible from the future>
+One-line pitch: <single sentence describing the v0.1 you can ship NOW that walks toward it>
+How it addresses the request: <2-3 sentences>
+Mechanism (technical): <2-3 sentences on how the v0.1 actually works today>
+First step the user could take this week: <one concrete action>
+Risks / what could break: <1-2 sentences — especially: WHICH of your three shifts is the weakest assumption, and what happens if it doesn't materialize on schedule>
+"""
+
+
+def build_futures_prompt(
+    topic: str,
+    cards: list[Card],
+    horizon_key: str,
+) -> str:
+    if horizon_key not in FUTURES_HORIZONS_BY_KEY:
+        raise ValueError(
+            f"unknown futures horizon {horizon_key!r}; "
+            f"known: {list(FUTURES_HORIZONS_BY_KEY)}"
+        )
+    h = FUTURES_HORIZONS_BY_KEY[horizon_key]
+    seeds = "\n".join(card.render() for card in cards)
+    return FUTURES_PROMPT_TEMPLATE.format(
+        topic=topic.strip(),
+        seeds=seeds,
+        horizon_name=h["horizon_name"],
+        framing=h["framing"],
+    )
+
+
 def build_prompt(
     topic: str,
     cards: list[Card],
@@ -956,6 +1093,120 @@ async def refine_idea(
     return await _query_text(prompt, SYNTHESIZER_SYSTEM, model)
 
 
+# ---------------------------------------------------------------------------
+# Deck evolution: when an idea wins the critic round, sharpen the cards
+# that contributed to it so they better carry the structural insight that
+# made the idea work. Memory as Read/Write: the deck is a learning artifact.
+# ---------------------------------------------------------------------------
+
+
+DECK_EVOLVE_SYSTEM = (
+    "You sharpen donor concept cards in a deck used by an applied-ideas "
+    "tool. Given a winning idea + the cards that contributed to it, you "
+    "rewrite each card so a future reader could see — from the card "
+    "alone — why this concept was transferable to that kind of problem. "
+    "Output strict JSONL: one JSON object per line, no preamble, no "
+    "code fence, no commentary."
+)
+
+
+DECK_EVOLVE_PROMPT_TEMPLATE = """\
+The user's problem was:
+
+  {topic}
+
+The winning idea (after refinement):
+
+  {idea}
+
+The cards below were drawn from the deck to generate that idea. Sharpen
+each card so the structural insight the winning idea exploited is now
+visible in the card itself. Keep the card name and source domain
+EXACTLY as given. Update only the body fields ({fields_list}). Do NOT
+invent new fields. Do NOT swap one card for a different concept.
+
+Cards to sharpen:
+{cards_json}
+
+For each card, output exactly one JSON object on its own line, with
+fields: {fields_list_quoted}. Do NOT wrap them in an array. Do NOT add
+commentary. Begin now:
+"""
+
+
+async def evolve_cards(
+    topic: str,
+    idea: str,
+    cards: list[Card],
+    depth: CardDepth,
+    model: str,
+) -> list[Card]:
+    """Rewrite donor cards in light of a winning idea. Returns updated cards
+    (matched by name to the input cards; un-matched stay as-is)."""
+    if not cards:
+        return []
+    fields_list = ", ".join(f for f in depth.fields if f not in ("name", "domain"))
+    fields_list_quoted = ", ".join(f'"{f}"' for f in depth.fields)
+    cards_json = "\n".join(
+        json.dumps(
+            {k: v for k, v in c.__dict__.items() if v is not None},
+            ensure_ascii=False,
+        )
+        for c in cards
+    )
+    prompt = DECK_EVOLVE_PROMPT_TEMPLATE.format(
+        topic=topic.strip(),
+        idea=idea.strip(),
+        cards_json=cards_json,
+        fields_list=fields_list or "(none for shallow depth)",
+        fields_list_quoted=fields_list_quoted,
+    )
+    raw = await _query_text(prompt, DECK_EVOLVE_SYSTEM, model)
+    new_cards = _parse_jsonl_cards(raw, depth)
+
+    # Match by case-insensitive name; drop any model-invented entries.
+    new_by_name = {c.name.lower(): c for c in new_cards}
+    out: list[Card] = []
+    for original in cards:
+        new = new_by_name.get(original.name.lower())
+        # Force the original name and domain — model is not allowed to swap.
+        if new is not None:
+            new.name = original.name
+            new.domain = original.domain
+            out.append(new)
+        else:
+            out.append(original)
+    return out
+
+
+def merge_evolved_into_deck(
+    deck: list[Card], evolved: list[Card],
+) -> list[Card]:
+    by_name = {c.name.lower(): c for c in evolved}
+    return [by_name.get(c.name.lower(), c) for c in deck]
+
+
+def save_deck_to_cache(
+    topic: str,
+    n: int,
+    depth: CardDepth,
+    model: str,
+    deck: list[Card],
+) -> Path:
+    path = _deck_cache_path(topic, n, depth, model)
+    path.write_text(
+        json.dumps(
+            [
+                {k: v for k, v in c.__dict__.items() if v is not None}
+                for c in deck
+            ],
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return path
+
+
 def load_bank(path: str | None) -> dict[str, list[str]]:
     if path is None:
         return DEFAULT_BANK
@@ -1105,9 +1356,37 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "load-bearing prior. Mutually exclusive with --einstein."
         ),
     )
+    p.add_argument(
+        "--futures",
+        action="store_true",
+        help=(
+            "Futures mode: project the user's field forward at four time "
+            "horizons (+1y / +3y / +10y / +30y), identify what is obvious "
+            "from each future, and ship a v0.1 today that walks toward it. "
+            "Forces n_ideas=4. Mutually exclusive with --einstein and --lsd."
+        ),
+    )
+    p.add_argument(
+        "--evolve-deck",
+        action="store_true",
+        help=(
+            "When --refine produces a winner, sharpen the cards that "
+            "contributed to it and write them back to the deck cache. "
+            "Subsequent runs against the same (topic, cards, depth, model) "
+            "see the evolved deck. Has no effect without --refine, and "
+            "is rejected with --bank (static banks aren't writable)."
+        ),
+    )
     args = p.parse_args(argv)
     if args.n_concepts < 2:
         p.error("--n-concepts must be at least 2 (blending needs >= 2 seeds)")
+    modes_on = sum(1 for f in (args.einstein, args.lsd, args.futures) if f)
+    if modes_on > 1:
+        p.error(
+            "--einstein, --lsd, --futures are mutually exclusive; pick one."
+        )
+    if args.evolve_deck and args.bank:
+        p.error("--evolve-deck requires a generated deck; not compatible with --bank")
     return args
 
 
@@ -1180,9 +1459,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             print(c.render())
         print()
 
-    if args.einstein and args.lsd:
+    # Mode mutual exclusion (parse_args also enforces this; belt and braces).
+    if sum(1 for f in (args.einstein, args.lsd, args.futures) if f) > 1:
         print(
-            "error: --einstein and --lsd are mutually exclusive. Pick one.",
+            "error: --einstein, --lsd, --futures are mutually exclusive.",
             file=sys.stderr,
         )
         return 2
@@ -1190,8 +1470,42 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     rng = random.Random(args.seed)
     ideas: list[str] = []
     mechanisms_used: list[str | None] = []
+    cards_per_idea: list[list[Card]] = []
 
-    if args.lsd:
+    if args.futures:
+        total = len(FUTURES_HORIZONS)
+        for i, h in enumerate(FUTURES_HORIZONS):
+            cards = sample_cards(
+                deck=deck, n=args.n_concepts, spread=spread, rng=rng,
+            )
+            header = (
+                f"\n=== Futures pass {i + 1}/{total}: {h['label']} | "
+                f"entropy={level.name} (spread={spread:.2f}) | "
+                f"deck={len(deck)}@{depth.name} | "
+                f"model={args.model} ===\n"
+            )
+            print(header)
+            print(f"Topic: {args.topic.strip()}")
+            print(f"Horizon: {h['horizon_name']}")
+            print(f"Framing: {h['framing']}")
+            print("Sampled cards:")
+            for c in cards:
+                print(c.render())
+            print()
+
+            prompt = build_futures_prompt(args.topic, cards, h["key"])
+            idea = await synthesize(
+                prompt=prompt,
+                model=args.model,
+                stream_to_stdout=not args.quiet,
+            )
+            ideas.append(idea)
+            mechanisms_used.append(h["label"])
+            cards_per_idea.append(cards)
+
+            if args.quiet:
+                print(idea)
+    elif args.lsd:
         # n_ideas passes, each dissolving one (model's-choice) load-bearing prior.
         for i in range(args.n_ideas):
             cards = sample_cards(
@@ -1222,6 +1536,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             )
             ideas.append(idea)
             mechanisms_used.append(LSD_LABEL)
+            cards_per_idea.append(cards)
 
             if args.quiet:
                 print(idea)
@@ -1256,6 +1571,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             )
             ideas.append(idea)
             mechanisms_used.append(mech["label"])
+            cards_per_idea.append(cards)
 
             if args.quiet:
                 print(idea)
@@ -1289,6 +1605,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             )
             ideas.append(idea)
             mechanisms_used.append(None)
+            cards_per_idea.append(cards)
 
             if args.quiet:
                 print(idea)
@@ -1331,6 +1648,45 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             model=args.model,
         )
         print(refined)
+
+        # --- Deck evolution (opt-in via --evolve-deck) --------------------
+        if args.evolve_deck and not args.bank:
+            print(
+                f"\n=== Deck evolution: sharpening "
+                f"{len(cards_per_idea[winner['i']])} card(s) that "
+                f"contributed to the winner ===\n"
+            )
+            try:
+                evolved = await evolve_cards(
+                    topic=args.topic,
+                    idea=refined,
+                    cards=cards_per_idea[winner["i"]],
+                    depth=depth,
+                    model=args.model,
+                )
+            except Exception as e:
+                print(f"  evolution failed: {e}", file=sys.stderr)
+                evolved = []
+            if evolved:
+                deck = merge_evolved_into_deck(deck, evolved)
+                path = save_deck_to_cache(
+                    args.topic, args.cards, depth, args.model, deck,
+                )
+                print(f"  wrote {len(evolved)} updated card(s) to {path}\n")
+                for original, new in zip(cards_per_idea[winner["i"]], evolved):
+                    print(f"  ◆ {original.name} ({original.domain})")
+                    for field in depth.fields:
+                        if field in ("name", "domain"):
+                            continue
+                        old_val = getattr(original, field, None) or ""
+                        new_val = getattr(new, field, None) or ""
+                        if old_val != new_val:
+                            print(f"    {field}:")
+                            print(f"      was: {old_val[:140]}")
+                            print(f"      now: {new_val[:140]}")
+                    print()
+            else:
+                print("  (no evolved cards parsed; deck unchanged)\n")
 
     return 0
 

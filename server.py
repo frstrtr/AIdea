@@ -26,18 +26,24 @@ from aidea import (
     CARD_DEPTHS,
     EINSTEIN_MECHANISMS,
     ENTROPY_LEVELS,
+    FUTURES_HORIZONS,
+    FUTURES_HORIZONS_BY_KEY,
     LSD_LABEL,
     Card,
     build_einstein_prompt,
+    build_futures_prompt,
     build_lsd_prompt,
     build_prompt,
     cards_from_static_bank,
     critic_score,
+    evolve_cards,
     load_bank,
     load_or_generate_deck,
+    merge_evolved_into_deck,
     parse_entropy,
     refine_idea,
     sample_cards,
+    save_deck_to_cache,
     synthesize,
     total_score,
 )
@@ -63,6 +69,8 @@ class GenerateRequest(BaseModel):
     refine: bool = False  # score ideas + refine the winner at low entropy
     einstein: bool = False  # four mechanism-specific passes instead of n_ideas
     lsd: bool = False  # prior-dissolution passes (mutually exclusive with einstein)
+    futures: bool = False  # four temporal-horizon passes (mut. excl. w/ einstein/lsd)
+    evolve_deck: bool = False  # rewrite winning cards back into the deck cache
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +117,23 @@ def _card_to_dict(c: Card) -> dict:
 
 
 async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
-    if req.einstein and req.lsd:
+    modes_on = sum(1 for f in (req.einstein, req.lsd, req.futures) if f)
+    if modes_on > 1:
         yield _sse("error", {
-            "message": "einstein and lsd modes are mutually exclusive; pick one.",
+            "message": (
+                "einstein, lsd, and futures modes are mutually exclusive; "
+                "pick at most one."
+            ),
+        })
+        return
+    if req.evolve_deck and req.bank_data is not None:
+        yield _sse("error", {
+            "message": "evolve_deck requires a generated deck; not compatible with bank_data.",
+        })
+        return
+    if req.evolve_deck and req.bank:
+        yield _sse("error", {
+            "message": "evolve_deck requires a generated deck; not compatible with bank (static).",
         })
         return
 
@@ -189,6 +211,8 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
     rng = random.Random(req.seed)
     ideas: list[str] = []
     mechanism_labels: list[str | None] = []
+    cards_per_idea: list[list[Card]] = []
+    cards_per_idea: list[list[Card]] = []
 
     if req.einstein:
         passes = [
@@ -203,6 +227,11 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         passes = [
             (("lsd", None), LSD_LABEL, lsd_blurb)
             for _ in range(req.n_ideas)
+        ]
+    elif req.futures:
+        passes = [
+            (("futures", h["key"]), h["label"], h["framing"])
+            for h in FUTURES_HORIZONS
         ]
     else:
         passes = [((None, None), None, None) for _ in range(req.n_ideas)]
@@ -235,6 +264,8 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             prompt = build_einstein_prompt(req.topic, cards, mech_key)
         elif mode == "lsd":
             prompt = build_lsd_prompt(req.topic, cards)
+        elif mode == "futures":
+            prompt = build_futures_prompt(req.topic, cards, mech_key)
         else:
             prompt = build_prompt(req.topic, cards, level)
 
@@ -255,6 +286,8 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
 
         ideas.append(idea)
         mechanism_labels.append(mech_label)
+        cards_per_idea.append(cards)
+        cards_per_idea.append(cards)
         yield _sse("idea", {
             "i": i,
             "text": idea,
@@ -331,6 +364,56 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         assert refined is not None
 
         yield _sse("refined", {"i": winner["i"], "text": refined})
+
+        # --- Stage 4: deck evolution (opt-in) ----------------------------
+        if req.evolve_deck and req.bank is None and req.bank_data is None:
+            winning_cards = cards_per_idea[winner["i"]]
+            yield _sse("status", {
+                "phase": "evolve",
+                "message": (
+                    f"Sharpening {len(winning_cards)} winning card(s) "
+                    "and writing them back to the deck cache..."
+                ),
+            })
+            evolved: list[Card] | None = None
+            try:
+                async for kind, payload in _watched(
+                    evolve_cards(
+                        topic=req.topic,
+                        idea=refined,
+                        cards=winning_cards,
+                        depth=depth,
+                        model=req.model,
+                    ),
+                    phase="evolve",
+                ):
+                    if kind == "progress":
+                        yield _sse("progress", payload)
+                    else:
+                        evolved = payload
+            except Exception as e:
+                yield _sse("error", {"message": f"evolve failed: {e}"})
+                return
+            if evolved:
+                deck = merge_evolved_into_deck(deck, evolved)
+                try:
+                    save_deck_to_cache(
+                        req.topic, req.cards, depth, req.model, deck,
+                    )
+                except Exception as e:
+                    yield _sse("error", {
+                        "message": f"deck cache write failed: {e}",
+                    })
+                    return
+                yield _sse("evolved", {
+                    "pairs": [
+                        {
+                            "before": _card_to_dict(o),
+                            "after": _card_to_dict(n),
+                        }
+                        for o, n in zip(winning_cards, evolved)
+                    ],
+                })
 
     yield _sse("done", {})
 
@@ -457,8 +540,30 @@ INDEX_HTML = r"""<!doctype html>
     background: linear-gradient(90deg, #6a2c75, #c9396a, #f0a544);
     color: #fff; text-shadow: 0 0 4px rgba(0,0,0,0.4);
   }
+  .mech-tag.futures {
+    background: linear-gradient(90deg, #1e6b6b, #2e8c63, #b59500);
+    color: #fff; text-shadow: 0 0 4px rgba(0,0,0,0.4);
+  }
   .mech-blurb { color: #666; font-size: 0.85rem; font-style: italic;
                 margin: 0.15rem 0 0.45rem; }
+  .evolve-card { margin: 0.6rem 0; padding: 0.5rem 0.7rem;
+                 border-left: 3px solid #1a8a4f; background: #f4faf6;
+                 border-radius: 0 4px 4px 0; }
+  .evolve-name { font-weight: 600; font-size: 0.95rem; }
+  .evolve-domain { color: #888; font-size: 0.82rem; font-weight: 400; }
+  .evolve-field { margin-top: 0.3rem; font-size: 0.86rem; }
+  .evolve-field b { color: #888; font-weight: 600; text-transform: uppercase;
+                    letter-spacing: 0.04em; font-size: 0.72rem;
+                    margin-right: 0.3rem; }
+  .evolve-before { color: #a33; font-family: ui-monospace, monospace;
+                   font-size: 0.85rem; margin: 0.1rem 0 0.1rem 1rem; }
+  .evolve-after { color: #1a8a4f; font-family: ui-monospace, monospace;
+                  font-size: 0.85rem; margin: 0 0 0 1rem; }
+  @media (prefers-color-scheme: dark) {
+    .evolve-card { background: #0f1a13; border-left-color: #3acb78; }
+    .evolve-before { color: #f08080; }
+    .evolve-after { color: #3acb78; }
+  }
   .error { color: #b00020; border-left-color: #b00020; }
   .score-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.2rem 0 0.4rem; }
   .score-pill { background: #eee; color: #333; border-radius: 999px;
@@ -562,6 +667,16 @@ INDEX_HTML = r"""<!doctype html>
     LSD mode — Prior Dissolution. Loosen the field's interpretive prior and re-perceive (Friston / Seth / REBUS). Uses n_ideas.
   </label>
 
+  <label class="inline">
+    <input type="checkbox" name="futures">
+    Futures mode — temporal projection (+1y · +3y · +10y · +30y). Identify what is obvious from each future, ship the v0.1 today. Overrides n_ideas to 4.
+  </label>
+
+  <label class="inline">
+    <input type="checkbox" name="evolve_deck">
+    Evolve deck — when refine produces a winner, sharpen the cards that contributed and write them back to the deck cache. Requires refine. Not compatible with bring-your-own-deck.
+  </label>
+
   <details class="advanced">
     <summary>Bring your own deck (optional)</summary>
     <label>
@@ -590,16 +705,27 @@ form.addEventListener('submit', async (e) => {
   for (const k of Object.keys(startByPhase)) delete startByPhase[k];
 
   const fd = new FormData(form);
-  if (fd.get('einstein') && fd.get('lsd')) {
-    addPanel('<div class="error">Einstein mode and LSD mode are mutually ' +
-             'exclusive. Pick one.</div>');
+  const modesOn = ['einstein', 'lsd', 'futures'].filter(k => fd.get(k)).length;
+  if (modesOn > 1) {
+    addPanel('<div class="error">Einstein, LSD, and Futures modes are ' +
+             'mutually exclusive. Pick at most one.</div>');
+    return;
+  }
+  if (fd.get('evolve_deck') && fd.get('bank_data')) {
+    addPanel('<div class="error">evolve_deck requires a generated deck; ' +
+             'not compatible with bring-your-own bank_data.</div>');
+    return;
+  }
+  if (fd.get('evolve_deck') && !fd.get('refine')) {
+    addPanel('<div class="error">evolve_deck has no effect without refine; ' +
+             'enable Critic + refine winner first.</div>');
     return;
   }
   const payload = {};
   for (const [k, v] of fd.entries()) {
     if (v === '') continue;
     if (['cards','n_concepts','n_ideas','seed'].includes(k)) payload[k] = Number(v);
-    else if (k === 'regen_deck' || k === 'refine' || k === 'einstein' || k === 'lsd') payload[k] = true;
+    else if (['regen_deck','refine','einstein','lsd','futures','evolve_deck'].includes(k)) payload[k] = true;
     else if (k === 'bank_data') {
       try {
         payload.bank_data = JSON.parse(v);
@@ -680,7 +806,7 @@ function handleEvent(chunk) {
   } else if (event === 'sample') {
     const cardHtml = obj.cards.map(renderCard).join('');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     const blurb = obj.mechanism_blurb
       ? '<div class="mech-blurb">' + escapeHtml(obj.mechanism_blurb) + '</div>'
@@ -696,7 +822,7 @@ function handleEvent(chunk) {
   } else if (event === 'idea') {
     finishStatus('synth-' + obj.i, 'idea ' + (obj.i + 1) + ' ready');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     addPanel(
       '<div class="meta">Idea ' + (obj.i + 1) + mechTag + '</div>' +
@@ -706,7 +832,7 @@ function handleEvent(chunk) {
     finishStatus('critic-' + obj.i,
                  'idea ' + (obj.i + 1) + ' scored ' + obj.total + '/300');
     const mechTag = obj.mechanism
-      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
+      ? '<span class="mech-tag' + (obj.mechanism === 'Prior Dissolution' ? ' lsd' : obj.mechanism && obj.mechanism.indexOf('Futures') === 0 ? ' futures' : '') + '">' + escapeHtml(obj.mechanism) + '</span>'
       : '';
     addPanel(
       '<div class="meta">Score · idea ' + (obj.i + 1) + mechTag + '</div>' +
@@ -733,6 +859,32 @@ function handleEvent(chunk) {
     addPanel(
       '<div class="meta refined-meta">Refined · idea ' + (obj.i + 1) + '</div>' +
       '<div class="idea refined"><pre>' + escapeHtml(obj.text) + '</pre></div>'
+    );
+  } else if (event === 'evolved') {
+    finishStatus('evolve', 'deck evolved: ' + obj.pairs.length + ' card(s) updated');
+    const rows = obj.pairs.map(function (pair) {
+      const before = pair.before, after = pair.after;
+      const fields = Object.keys(after).filter(function (k) {
+        return k !== 'name' && k !== 'domain' && before[k] !== after[k];
+      });
+      const fieldRows = fields.map(function (f) {
+        return (
+          '<div class="evolve-field"><b>' + escapeHtml(f.replace(/_/g, ' ')) + '</b>' +
+          '<div class="evolve-before">- was: ' + escapeHtml(String(before[f] || '')) + '</div>' +
+          '<div class="evolve-after">+ now: ' + escapeHtml(String(after[f] || '')) + '</div>' +
+          '</div>'
+        );
+      }).join('');
+      return (
+        '<div class="evolve-card"><div class="evolve-name">◆ ' +
+        escapeHtml(before.name) +
+        ' <span class="evolve-domain">(' + escapeHtml(before.domain) + ')</span></div>' +
+        fieldRows + '</div>'
+      );
+    }).join('');
+    addPanel(
+      '<div class="meta refined-meta">Deck evolved (winner’s cards sharpened ' +
+      'and written back to cache)</div>' + rows
     );
   } else if (event === 'done') {
     addPanel('<div class="status done"><span class="dot"></span>' +
