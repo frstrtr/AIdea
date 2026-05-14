@@ -255,6 +255,93 @@ structural insight that worked. The deck becomes a learning artifact
 across sessions — closer to how the brain actually represents
 experience (reconstructed each time, not retrieved verbatim).
 
+## Self-evolution — card-level RAG
+
+After every run, the donor cards that were generated for the topic get
+appended to a per-source corpus (`cards_corpus.jsonl`). Before the next
+run's deck-gen, the system retrieves the top-K cards from past runs in
+the same source whose topics are most similar (BM25), and injects them
+as "warm-start examples" into the deck-gen prompt — *not* into the
+synthesizer.
+
+The boundary is load-bearing: **retrieval lives at the deck-gen layer
+only**. The synthesis prompt never sees retrieved past ideas, which is
+what would otherwise collapse the entropy mechanism into "regress to
+previous winners". Cards seed; ideas always stay fresh.
+
+### Quality signals that compound
+
+Cards from refine-winners get a quality label (the critic's 0–300
+score). At retrieval time, ranking is `bm25_score × (1 + critic_total /
+300)` — so proven winners surface preferentially. Two ways to record
+quality:
+
+- **Implicit** — turn on `refine=true` and the critic's score is
+  recorded automatically against the winning idea's cards.
+- **Explicit** — Telegram `/feedback useful [comment]` writes `+50`;
+  `/feedback bad [comment]` writes `-100`. Web UI has thumbs widget
+  posting to `/api/feedback`. Both target the last completed run.
+
+Cards with no quality label yet rank by similarity alone — the corpus
+self-evolves as more refine and feedback signals accumulate.
+
+### Privacy: per-source tenant isolation
+
+After the bootstrap window closes (see below), retrieval strictly
+filters by `source`:
+
+- Each Telegram chat_id only ever retrieves from its own past
+- Web only retrieves from `source == "web"` past
+- CLI from its own ops history
+
+There is no shared global pool after bootstrap. PII (emails, URLs,
+long numeric strings) is scrubbed from topics on every ingest
+regardless of state.
+
+### Bootstrap mode — cold-start window
+
+For the first 1000 user-facing queries (env-tunable via
+`AIDEA_BOOTSTRAP_THRESHOLD`), retrieval pools across **all sources** so
+the corpus is useful from day 1 rather than after months of solo
+accumulation. Users are informed upfront:
+
+- Bot: notice sent once per chat on first request during bootstrap
+- Web: yellow banner driven by `/api/bootstrap`
+- Both: `/bootstrap` command (bot) and `/api/bootstrap` endpoint (web)
+  surface the current counter and switch state
+
+When `queries_seen >= threshold`, the flip is automatic:
+`bootstrap_state.json` records `active: false`, `switched_at` is
+populated, and retrieval reverts to strict per-source filter. CLI
+queries don't burn the bootstrap window. The web banner turns green.
+
+### Backend
+
+Day-1 backend is **BM25** (`rank_bm25`). Token-level lexical retrieval,
+no model download, fast on small corpora. When the corpus grows past
+~500 cards/source and lexical retrieval starts missing semantic
+overlap, drop in a local-CPU embedding model (`fastembed` /
+`sentence-transformers`) behind the same `retrieve_similar()` signature
+— switch via `AIDEA_RAG_BACKEND=embed` in `.env`. No schema migration.
+
+### Language
+
+Every LLM call detects the topic's primary language and responds in it
+— including section labels (Title / Pitch / Mechanism — translated
+where natural). JSON keys stay English (parsed by code); JSON values
+follow the topic language. Technical terms native to English (API
+names, library names, established jargon) stay English.
+
+### Inspection
+
+| Surface | What it shows |
+|---|---|
+| `/api/corpus[?source=X]` | Card counts, sources, modes, quality-labelled fraction |
+| `/api/bootstrap` | Bootstrap state + notice text |
+| Bot `/corpus` | Tenant-scoped corpus stats |
+| Bot `/bootstrap` | Bootstrap counter + notice + switch status |
+| Bot `/feedback useful\|bad [comment]` | Explicit ±boost on last run's cards |
+
 ## Theme generator
 
 The donor-domain list is **LLM-generated per request**, biased by entropy
