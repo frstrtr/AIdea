@@ -788,9 +788,13 @@ INDEX_HTML = r"""<!doctype html>
   .panel.usage[data-expanded="true"] .meta::before { transform: rotate(90deg); }
   .panel.usage #usage-body { display: none; }
   .panel.usage[data-expanded="true"] #usage-body { display: block; }
-  .usage-refresh { cursor: pointer; color: #888; margin-left: 0.4rem;
+  .usage-refresh { cursor: pointer; color: #888; margin-left: auto;
                    font-size: 0.85rem; user-select: none; }
   .usage-refresh:hover { color: #1a1a1a; }
+  .usage-summary { color: #555; font-size: 0.85rem; font-weight: 400;
+                   font-family: ui-monospace, "SF Mono", Menlo, monospace;
+                   margin-left: 0.6rem; }
+  .usage-summary:empty { display: none; }
   .usage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
                 gap: 0.5rem; margin-top: 0.4rem; }
   .usage-card { background: #fff; border: 1px solid #eee; border-radius: 6px;
@@ -1110,7 +1114,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="output"></div>
 
 <div id="usage-strip" class="panel usage" hidden>
-  <div class="meta">LLM usage <span id="usage-refresh" class="usage-refresh" title="Reload usage from log">↻</span></div>
+  <div class="meta">LLM usage<span id="usage-summary" class="usage-summary"></span><span id="usage-refresh" class="usage-refresh" title="Reload usage from log">↻</span></div>
   <div id="usage-body"></div>
 </div>
 
@@ -1497,8 +1501,30 @@ function usageBucket(label, b) {
 function renderUsage(u) {
   const strip = document.getElementById('usage-strip');
   const body = document.getElementById('usage-body');
+  const summary = document.getElementById('usage-summary');
   if (!strip || !body) return;
   strip.hidden = false;
+
+  // One-liner shown on the collapsed header so cost / call-count / next
+  // reset are visible without clicking. Pulled from the "total" bucket
+  // because that's the most stable number; rate-limit reset is the only
+  // future-pointing bit and useful at a glance.
+  if (summary) {
+    const t = u.total || {};
+    const parts = [
+      fmtUsd(t.total_cost_usd || 0),
+      (t.calls || 0) + ' call' + (t.calls === 1 ? '' : 's'),
+      fmtTokens(t.output_tokens || 0) + ' out',
+    ];
+    if (u.rate_limit && u.rate_limit.resets_at) {
+      const dt = u.rate_limit.resets_at - Date.now() / 1000;
+      if (dt > 0) {
+        const h = Math.floor(dt / 3600), m = Math.floor((dt % 3600) / 60);
+        parts.push('resets in ' + (h ? h + 'h ' : '') + m + 'm');
+      }
+    }
+    summary.textContent = '· ' + parts.join(' · ');
+  }
 
   let rateHtml = '';
   if (u.rate_limit) {
