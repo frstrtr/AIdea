@@ -82,6 +82,32 @@ from usage import (
 DECK_CACHE_DIR = Path(__file__).parent / "decks"
 
 
+# ---------------------------------------------------------------------------
+# Language rule — appended to every system prompt.
+#
+# Users have reported English replies when their topic was in another
+# language. The English prompt templates were inadvertently anchoring the
+# output language. Make the rule explicit and unconditional: detect the
+# topic's primary language, respond entirely in it — section labels and
+# all. JSON keys stay English (we parse them); JSON values follow the
+# topic language.
+# ---------------------------------------------------------------------------
+
+
+LANGUAGE_RULE = (
+    "\n\nLANGUAGE: Detect the primary language of the user's topic and "
+    "respond ENTIRELY in that language — including section labels like "
+    "'Title:', 'One-line pitch:', 'Mechanism:', etc. (translate them). If "
+    "the topic is mixed-language, use whichever language clearly dominates; "
+    "fall back to English only if you genuinely cannot identify a dominant "
+    "language. Technical terms native to English (API / library / product "
+    "names, established jargon) stay in English. The ONE exception: when "
+    "the prompt asks you to emit JSON, the JSON KEY NAMES stay English "
+    "verbatim (they are parsed by code); the VALUES inside the JSON follow "
+    "the topic language."
+)
+
+
 # Seed concept bank. These are *donor concepts* — structural mechanisms
 # from various domains that get cross-pollinated onto the user's topic.
 DEFAULT_BANK: dict[str, list[str]] = {
@@ -313,6 +339,7 @@ THEMES_SYSTEM = (
     "where structural mechanisms live (e.g. 'harbor pilotage', 'monastic "
     "rules', 'mycorrhizal symbiosis'), not generic categories ('transport', "
     "'religion', 'biology')."
+    + LANGUAGE_RULE
 )
 
 
@@ -401,6 +428,7 @@ DECK_GEN_SYSTEM = (
     "You generate donor concept decks for an idea-synthesis tool. Your output "
     "is JSON Lines (one JSON object per line, no commentary, no surrounding "
     "fences). Each object is one card."
+    + LANGUAGE_RULE
 )
 
 
@@ -1357,6 +1385,7 @@ SYNTHESIZER_SYSTEM = (
     "of cross-domain donor concepts and produce ONE specific, executable idea. "
     "Respond in the exact format requested by the user — no preamble, no "
     "closing remarks, no offers to help further."
+    + LANGUAGE_RULE
 )
 
 
@@ -1553,6 +1582,7 @@ CRITIC_SYSTEM = (
     "You are a critic for an applied-ideas synthesizer. You score a single "
     "idea against a user problem on three axes. Output STRICT JSON only — "
     "one object, no surrounding code fences, no preamble, no commentary."
+    + LANGUAGE_RULE
 )
 
 
@@ -1684,6 +1714,7 @@ DECK_EVOLVE_SYSTEM = (
     "alone — why this concept was transferable to that kind of problem. "
     "Output strict JSONL: one JSON object per line, no preamble, no "
     "code fence, no commentary."
+    + LANGUAGE_RULE
 )
 
 
