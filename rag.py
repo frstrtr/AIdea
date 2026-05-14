@@ -51,9 +51,127 @@ except ImportError:
 
 CARDS_CORPUS = Path(__file__).parent / "cards_corpus.jsonl"
 OUTCOMES_LOG = Path(__file__).parent / "card_outcomes.jsonl"
+BOOTSTRAP_STATE_FILE = Path(__file__).parent / "bootstrap_state.json"
 
 # Cap retrieval cost — past N records is plenty for BM25 at scale.
 _CORPUS_LOOKBACK = int(os.environ.get("AIDEA_RAG_LOOKBACK", "5000"))
+
+# How many user-facing queries to gather before flipping from aggregate
+# (shared, anonymized) retrieval to strict per-source. During bootstrap,
+# the goal is to make the RAG actually useful from day 1 rather than
+# after months of solo accumulation. After the threshold, all future
+# retrievals strictly filter by ``source``.
+_BOOTSTRAP_THRESHOLD = int(os.environ.get("AIDEA_BOOTSTRAP_THRESHOLD", "1000"))
+
+
+# ---------------------------------------------------------------------------
+# PII scrub — applied to the ``topic`` field on every ingest.
+# ---------------------------------------------------------------------------
+
+
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+_URL_RE = re.compile(r"https?://\S+")
+_LONG_NUM_RE = re.compile(r"\b\d{7,}\b")  # phone / order / ID-like
+
+
+def scrub_topic(topic: str) -> str:
+    """Strip obvious PII from a user topic before storage.
+
+    Applied always, not just during bootstrap — the topic is in the
+    corpus regardless of retrieval scope and the scrubs are essentially
+    free in retrieval quality (BM25 keeps the surrounding words). Reduces
+    the cost of an honest mistake (someone pasting an order number /
+    email / URL into their topic line)."""
+    if not topic:
+        return ""
+    t = _EMAIL_RE.sub("[email]", topic)
+    t = _URL_RE.sub("[url]", t)
+    t = _LONG_NUM_RE.sub("[number]", t)
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap state: persisted counter + active flag.
+# ---------------------------------------------------------------------------
+
+
+def _default_bootstrap_state() -> dict[str, Any]:
+    return {
+        "threshold": _BOOTSTRAP_THRESHOLD,
+        "queries_seen": 0,
+        "active": True,
+        "started_at": int(time.time()),
+        "switched_at": None,
+    }
+
+
+def _load_bootstrap_state() -> dict[str, Any]:
+    if not BOOTSTRAP_STATE_FILE.exists():
+        return _default_bootstrap_state()
+    try:
+        s = json.loads(BOOTSTRAP_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _default_bootstrap_state()
+    # Tolerate older / partial files.
+    base = _default_bootstrap_state()
+    base.update({k: v for k, v in s.items() if k in base})
+    # Honor the env-var threshold if it has gone up since last write.
+    base["threshold"] = max(int(base.get("threshold") or 0), _BOOTSTRAP_THRESHOLD)
+    return base
+
+
+def _save_bootstrap_state(state: dict[str, Any]) -> None:
+    try:
+        BOOTSTRAP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BOOTSTRAP_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+        tmp.replace(BOOTSTRAP_STATE_FILE)
+    except OSError:
+        pass
+
+
+def bootstrap_state() -> dict[str, Any]:
+    """Read-only view of the current bootstrap state. Safe for /api/bootstrap."""
+    s = _load_bootstrap_state()
+    s["remaining"] = max(0, int(s["threshold"]) - int(s["queries_seen"]))
+    return s
+
+
+def note_query(source: str) -> dict[str, Any]:
+    """Increment the bootstrap counter (called once per user-facing request)
+    and flip to per-source mode if the threshold has been crossed. Returns
+    the (post-increment) state so callers can show the user the latest
+    counter. CLI sources (``source=='cli'``) are NOT counted — only
+    ``web`` and ``telegram-*``."""
+    s = _load_bootstrap_state()
+    if source != "cli":
+        s["queries_seen"] = int(s.get("queries_seen", 0)) + 1
+        if s.get("active") and s["queries_seen"] >= int(s["threshold"]):
+            s["active"] = False
+            s["switched_at"] = int(time.time())
+        _save_bootstrap_state(s)
+    s["remaining"] = max(0, int(s["threshold"]) - int(s["queries_seen"]))
+    return s
+
+
+def bootstrap_notice_text() -> str:
+    """User-facing notice describing the bootstrap trade. Returns the empty
+    string when bootstrap is no longer active."""
+    s = _load_bootstrap_state()
+    if not s.get("active"):
+        return ""
+    return (
+        "⚠️ Bootstrap mode\n"
+        "For the first {threshold} queries across all users, your topic and "
+        "the generated donor cards are added to a shared anonymized corpus "
+        "that warm-starts everyone's deck generation. Personal details "
+        "(emails, URLs, long numeric strings) are scrubbed before storage. "
+        "After {threshold} queries (currently {seen}/{threshold}), retrieval "
+        "automatically switches to per-channel isolation — your future "
+        "queries only see your own chat's past. This is a one-time "
+        "cold-start measure to make the system useful on day 1 rather "
+        "than after months of solo accumulation."
+    ).format(threshold=int(s["threshold"]), seen=int(s["queries_seen"]))
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +223,7 @@ def ingest_deck(
                     "ts": ts,
                     "run_id": run_id or "unknown",
                     "source": source or "unknown",
-                    "topic": topic or "",
+                    "topic": scrub_topic(topic or ""),
                     "mode": mode or "default",
                     "card": body,
                 }
@@ -271,16 +389,24 @@ def retrieve_similar(
     topic: str,
     k: int = 8,
 ) -> list[dict[str, Any]]:
-    """Top-K past cards from ``source`` ranked by relevance to ``topic``.
+    """Top-K past cards ranked by relevance to ``topic``.
+
+    Scope:
+      - During bootstrap (queries_seen < threshold): aggregate across ALL
+        sources to make retrieval useful from day 1. Users have been
+        informed upfront via bootstrap_notice_text().
+      - After bootstrap: strict per-``source`` filter — tenant-isolated.
 
     Falls back to an empty list when:
       - ``rank_bm25`` is not installed
-      - corpus is empty for this source
+      - corpus is empty in the chosen scope
       - query tokenizes to zero terms
     """
     if not _BM25_AVAILABLE:
         return []
-    corpus = _load_corpus(source=source)
+    state = _load_bootstrap_state()
+    scope_source: str | None = source if not state.get("active") else None
+    corpus = _load_corpus(source=scope_source)
     if not corpus:
         return []
     outcomes = _load_outcomes()

@@ -138,6 +138,11 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
     from transcripts import set_source, log_event as transcript_log
     run_id = start_run("web")
     set_source("web")
+    try:
+        from rag import note_query
+        note_query("web")
+    except Exception:
+        pass
     yield _sse("run", {"run_id": run_id})
 
     mode = (
@@ -621,6 +626,17 @@ async def corpus_endpoint(source: str | None = None) -> dict:
     return rag_stats(source=source)
 
 
+@app.get("/api/bootstrap")
+async def bootstrap_endpoint() -> dict:
+    """Cold-start bootstrap state: counter, threshold, active flag, notice
+    text. While active, RAG retrieval is aggregate across all sources;
+    after the threshold, retrieval is strictly per-source."""
+    from rag import bootstrap_state, bootstrap_notice_text
+    s = bootstrap_state()
+    s["notice"] = bootstrap_notice_text()
+    return s
+
+
 class FeedbackRequest(BaseModel):
     run_id: str = Field(..., min_length=1)
     useful: bool
@@ -878,6 +894,21 @@ INDEX_HTML = r"""<!doctype html>
     .winner-banner { background: #1a1a0a; border-left-color: #b59500;
                      color: #f0e0a0; }
   }
+  .bootstrap-banner {
+    border: 1px solid #b59500; background: #fff8d8;
+    color: #2a2300; padding: 0.7rem 0.9rem; border-radius: 6px;
+    margin: 0 0 1rem; font-size: 0.92rem; line-height: 1.4;
+    white-space: pre-wrap;
+  }
+  .bootstrap-banner.complete {
+    border-color: #1a8a4f; background: #f4faf6; color: #103820;
+  }
+  @media (prefers-color-scheme: dark) {
+    .bootstrap-banner { background: #1a1a0a; border-color: #b59500;
+                        color: #f0e0a0; }
+    .bootstrap-banner.complete { background: #0f1a13; border-color: #3acb78;
+                                 color: #c5e9c8; }
+  }
 </style>
 </head>
 <body>
@@ -889,6 +920,8 @@ INDEX_HTML = r"""<!doctype html>
   depart from current practice). Feasibility is enforced at every level
   except Dream / Lucid.
 </p>
+
+<div id="bootstrap-banner" class="bootstrap-banner" hidden></div>
 
 <details class="modes-legend">
   <summary>Modes — pick at most one</summary>
@@ -1297,6 +1330,8 @@ function handleEvent(chunk) {
   } else if (event === 'usage') {
     renderUsage(obj);
   } else if (event === 'done') {
+    // Refresh bootstrap counter + corpus stats after every run.
+    try { loadBootstrap(); } catch (_) {}
     const rid = window.__aideaLastRunId || '';
     addPanel(
       '<div class="status done"><span class="dot"></span>' +
@@ -1496,6 +1531,34 @@ async function loadUsage() {
 }
 document.getElementById('usage-refresh').addEventListener('click', loadUsage);
 loadUsage();
+
+async function loadBootstrap() {
+  const el = document.getElementById('bootstrap-banner');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/bootstrap');
+    if (!r.ok) return;
+    const s = await r.json();
+    if (s.active) {
+      el.className = 'bootstrap-banner';
+      const remaining = Math.max(0, (s.threshold|0) - (s.queries_seen|0));
+      const head = '⚠️ Bootstrap mode — ' + (s.queries_seen|0) + '/' +
+                   (s.threshold|0) + ' queries · ' + remaining + ' remaining';
+      el.textContent = head + '\n\n' + (s.notice || '');
+      el.hidden = false;
+    } else {
+      el.className = 'bootstrap-banner complete';
+      el.textContent =
+        '✓ Per-channel mode active. Retrieval now scoped strictly to your '
+      + 'channel. Past pooled data remains in the corpus as background '
+      + 'signal but new queries no longer cross channels.';
+      el.hidden = false;
+    }
+  } catch (_) { /* ignore */ }
+}
+loadBootstrap();
+// Re-check whenever a run completes so the counter ticks in real time.
+window.addEventListener('aidea:run-complete', loadBootstrap);
 </script>
 </body>
 </html>"""

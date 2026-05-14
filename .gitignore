@@ -17,6 +17,7 @@ usage.jsonl
 transcripts.jsonl
 cards_corpus.jsonl
 card_outcomes.jsonl
+bootstrap_state.json
 .env
 
 # Editor / OS

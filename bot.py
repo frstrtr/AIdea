@@ -105,6 +105,7 @@ class ChatState:
     busy: bool = False
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     last_run_id: str | None = None  # target of /feedback when no id is passed
+    bootstrap_notice_sent: bool = False  # one-shot upfront notice during bootstrap
 
 
 # chat_id -> ChatState
@@ -277,6 +278,16 @@ async def run_pipeline_for_telegram(
     run_id = start_run(f"tg-{chat_id}")
     state.last_run_id = run_id  # /feedback targets this run by default
     set_source(f"telegram-{chat_id}")
+    try:
+        from rag import note_query, bootstrap_state, bootstrap_notice_text
+        bs = note_query(f"telegram-{chat_id}")
+        if bs.get("active") and not state.bootstrap_notice_sent:
+            notice = bootstrap_notice_text()
+            if notice:
+                await context.bot.send_message(chat_id=chat_id, text=notice)
+            state.bootstrap_notice_sent = True
+    except Exception:
+        pass
     s = state.settings
     spread, level = parse_entropy(s.entropy)
     depth = CARD_DEPTH_BY_NAME[s.card_depth]
@@ -898,6 +909,28 @@ async def cmd_feedback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_bootstrap(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the cold-start bootstrap counter and whether per-channel
+    isolation has kicked in yet."""
+    from rag import bootstrap_state, bootstrap_notice_text
+    s = bootstrap_state()
+    if s.get("active"):
+        text = (
+            f"Bootstrap: ACTIVE  ·  {int(s['queries_seen'])}/{int(s['threshold'])} "
+            f"queries  ·  {int(s['remaining'])} remaining\n"
+            f"Retrieval is aggregate across all sources right now.\n\n"
+            + bootstrap_notice_text()
+        )
+    else:
+        sw = s.get("switched_at")
+        text = (
+            f"Bootstrap: COMPLETE  ·  switched at unix {sw}\n"
+            "Retrieval is now strict per-channel — your future queries "
+            "only see your own chat's past cards."
+        )
+    await update.message.reply_text(text)
+
+
 async def cmd_corpus(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show RAG-corpus stats for this chat (per-source-scoped)."""
     from rag import stats as rag_stats, format_stats_text
@@ -956,6 +989,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("corpus", cmd_corpus))
     app.add_handler(CommandHandler("feedback", cmd_feedback))
+    app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_fallback))
     return app
