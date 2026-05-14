@@ -621,6 +621,29 @@ async def corpus_endpoint(source: str | None = None) -> dict:
     return rag_stats(source=source)
 
 
+class FeedbackRequest(BaseModel):
+    run_id: str = Field(..., min_length=1)
+    useful: bool
+    comment: str | None = None
+
+
+@app.post("/api/feedback")
+async def feedback_endpoint(req: FeedbackRequest) -> dict:
+    """Record an explicit user quality signal targeting a prior run.
+
+    Useful=True boosts cards drawn in that run; False suppresses them on
+    the next retrieval. Per-source scoping is honored because the feedback
+    record carries the same source label the run was tagged with."""
+    from rag import record_feedback
+    record_feedback(
+        run_id=req.run_id,
+        useful=req.useful,
+        comment=req.comment or "",
+        source="web",
+    )
+    return {"ok": True, "run_id": req.run_id, "useful": req.useful}
+
+
 @app.post("/api/generate")
 async def generate(req: GenerateRequest):
     if req.cards < req.n_concepts:
@@ -801,6 +824,22 @@ INDEX_HTML = r"""<!doctype html>
     .idea { background: #111; border-left-color: #e5e5e5; }
     .idea.refined { background: #0f1a13; border-left-color: #3acb78; }
     .meta.refined-meta { color: #3acb78; }
+  }
+  .feedback-row { margin-top: 0.6rem; font-size: 0.9rem;
+                  display: flex; flex-wrap: wrap; align-items: center;
+                  gap: 0.5rem; }
+  .feedback-label { color: var(--muted, #888); }
+  .feedback-btn { padding: 0.25rem 0.65rem; border-radius: 999px;
+                  border: 1px solid #ddd; background: #fff;
+                  font-size: 0.85rem; cursor: pointer; }
+  .feedback-btn:hover { background: #f4f4f4; }
+  .feedback-btn:disabled { opacity: 0.55; cursor: default; background: #fafafa; }
+  .feedback-status { color: #1a8a4f; font-size: 0.85rem; }
+  @media (prefers-color-scheme: dark) {
+    .feedback-btn { background: #1a1a1a; border-color: #333; color: #ddd; }
+    .feedback-btn:hover { background: #222; }
+    .feedback-btn:disabled { background: #161616; color: #777; }
+    .feedback-status { color: #5eea9a; }
   }
   details.modes-legend { margin-bottom: 1.2rem; }
   details.modes-legend > summary {
@@ -1254,16 +1293,52 @@ function handleEvent(chunk) {
       'and written back to cache)</div>' + rows
     );
   } else if (event === 'run') {
-    // captured for completeness; nothing to render
+    window.__aideaLastRunId = obj.run_id;
   } else if (event === 'usage') {
     renderUsage(obj);
   } else if (event === 'done') {
-    addPanel('<div class="status done"><span class="dot"></span>' +
-             '<span class="msg">Done.</span></div>');
+    const rid = window.__aideaLastRunId || '';
+    addPanel(
+      '<div class="status done"><span class="dot"></span>' +
+      '<span class="msg">Done.</span></div>' +
+      (rid
+        ? '<div class="feedback-row" data-run="' + escapeHtml(rid) + '">' +
+          '<span class="feedback-label">Was this useful? It biases the deck next time:</span>' +
+          ' <button type="button" class="feedback-btn" data-useful="true">👍 useful</button>' +
+          ' <button type="button" class="feedback-btn" data-useful="false">👎 not useful</button>' +
+          ' <span class="feedback-status"></span>' +
+          '</div>'
+        : '')
+    );
   } else if (event === 'error') {
     addPanel('<div class="error">' + escapeHtml(obj.message) + '</div>');
   }
 }
+
+// Feedback click handler — sticks to the parent `out` container so it survives
+// the panel re-render that happens on each new generation.
+out.addEventListener('click', async function (e) {
+  const btn = e.target.closest('.feedback-btn');
+  if (!btn) return;
+  const row = btn.closest('.feedback-row');
+  if (!row) return;
+  const runId = row.getAttribute('data-run');
+  const useful = btn.getAttribute('data-useful') === 'true';
+  const statusEl = row.querySelector('.feedback-status');
+  if (statusEl) statusEl.textContent = '…';
+  try {
+    const resp = await fetch('/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: runId, useful: useful }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    row.querySelectorAll('.feedback-btn').forEach(b => b.disabled = true);
+    if (statusEl) statusEl.textContent = useful ? '✓ recorded as useful' : '✓ recorded as not useful';
+  } catch (err) {
+    if (statusEl) statusEl.textContent = 'failed: ' + (err.message || err);
+  }
+});
 
 function upsertStatus(phase, message) {
   let panel = statusByPhase[phase];
