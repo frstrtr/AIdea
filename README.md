@@ -110,6 +110,35 @@ The page exposes the same knobs as the CLI plus:
   is on, per-idea score pills, a yellow winner banner, and a green-bordered
   "REFINED" panel appear below.
 
+## Modes
+
+Pick at most one per request. Each is a structurally different way to
+generate ideas — not a different temperature setting on the same default.
+
+| Mode | What it does | Feasibility | n_ideas |
+|---|---|---|---|
+| `default` | Standard pass at requested entropy | required | configurable |
+| `einstein` | Four mechanism-specific passes (Adjacent Possible · Exaptation · Slow Hunch · Productive Error) | required | forced to 4 |
+| `lsd` | Prior Dissolution (Friston / Seth / REBUS). Suspends the field's interpretive prior and re-perceives | required | configurable |
+| `futures` | Four temporal horizons (+1y / +3y / +10y / +30y). Names what's obvious from each future and ships a v0.1 today | required | forced to 4 |
+| `dream` | Prediction-error offline. Generative model runs free, no feasibility constraint. Output is a dream image + "what survives waking" | **off** | configurable |
+| `lucid` | Dream + a directional prior you inject. Hallucination biases toward your prior, with one reality check at the end | **off** | configurable |
+
+CLI flags: `--einstein`, `--lsd`, `--futures`, `--dream`, `--lucid "<prior sentence>"`.
+The five are mutually exclusive. Web UI exposes them as checkboxes + a
+prior textarea. Telegram exposes them as `/einstein`, `/lsd`, `/futures`,
+`/dream`, `/lucid <prior> :: <topic>`.
+
+## Theme generator
+
+The donor-domain list is **LLM-generated per request**, biased by entropy
+— not a hardcoded set. At low entropy the themes stay in-field
+("VC due diligence", "product-led growth loops"). At high entropy they go
+wildly distant ("Carthaginian tophet rites", "cordyceps host
+manipulation", "Edo-period firefighter matoi signaling"). Override
+explicitly with `--themes "harbor pilotage, mycology, monastic rules"` or
+tune separately from the main entropy with `--theme-entropy 0.85`.
+
 ## Entropy levels
 
 | Level   | Spread | What it asks of the synthesizer                                |
