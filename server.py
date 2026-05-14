@@ -14,7 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from typing import AsyncIterator
+import time
+from typing import Any, AsyncIterator, Awaitable
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -62,6 +63,31 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
+HEARTBEAT_INTERVAL = 1.5  # seconds
+
+
+async def _watched(
+    awaitable: Awaitable[Any], phase: str
+) -> AsyncIterator[tuple[str, Any]]:
+    """Drive an awaitable while yielding ('progress', elapsed) ticks.
+
+    Final yield is ('result', value). Lets the SSE generator emit live
+    elapsed-time updates during the long LLM calls so the UI knows the
+    request is alive even when the underlying SDK delivers its response
+    as a single chunk (no token streaming through the agent SDK).
+    """
+    task = asyncio.create_task(awaitable)
+    start = time.monotonic()
+    while not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL)
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - start
+            yield "progress", {"phase": phase, "elapsed": round(elapsed, 1)}
+    result = await task
+    yield "result", result
+
+
 def _card_to_dict(c: Card) -> dict:
     return {k: v for k, v in c.__dict__.items() if v is not None}
 
@@ -84,28 +110,47 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
     depth = CARD_DEPTH_BY_NAME[req.card_depth]
 
     # --- Stage 0: deck -----------------------------------------------------
-    yield _sse("status", {
-        "phase": "deck",
-        "message": (
-            f"Using static bank: {req.bank}" if req.bank
-            else f"Generating donor deck (n={req.cards}, depth={depth.name})..."
-        ),
-    })
-    try:
-        if req.bank:
+    if req.bank:
+        yield _sse("status", {
+            "phase": "deck",
+            "message": f"Loading static bank: {req.bank}",
+        })
+        try:
             deck = cards_from_static_bank(load_bank(req.bank))
-        else:
-            deck = await load_or_generate_deck(
-                topic=req.topic,
-                n=req.cards,
-                depth=depth,
-                model=req.model,
-                force_regen=req.regen_deck,
-                verbose=False,
-            )
-    except Exception as e:
-        yield _sse("error", {"message": f"deck stage failed: {e}"})
-        return
+        except Exception as e:
+            yield _sse("error", {"message": f"deck stage failed: {e}"})
+            return
+    else:
+        yield _sse("status", {
+            "phase": "deck",
+            "message": (
+                f"Generating donor deck "
+                f"(n={req.cards}, depth={depth.name}). "
+                f"At depth={depth.name} expect 30-120s on first run; "
+                f"cached after."
+            ),
+        })
+        deck = None
+        try:
+            async for kind, payload in _watched(
+                load_or_generate_deck(
+                    topic=req.topic,
+                    n=req.cards,
+                    depth=depth,
+                    model=req.model,
+                    force_regen=req.regen_deck,
+                    verbose=False,
+                ),
+                phase="deck",
+            ):
+                if kind == "progress":
+                    yield _sse("progress", payload)
+                else:
+                    deck = payload
+        except Exception as e:
+            yield _sse("error", {"message": f"deck stage failed: {e}"})
+            return
+        assert deck is not None
 
     yield _sse("deck", {
         "size": len(deck),
@@ -124,18 +169,28 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             "cards": [_card_to_dict(c) for c in cards],
         })
 
+        synth_phase = f"synth-{i}"
         yield _sse("status", {
-            "phase": "synth",
+            "phase": synth_phase,
             "i": i,
             "message": f"Synthesizing idea {i + 1}/{req.n_ideas}...",
         })
 
         prompt = build_prompt(req.topic, cards, level)
+        idea: str | None = None
         try:
-            idea = await synthesize(prompt=prompt, model=req.model, stream_to_stdout=False)
+            async for kind, payload in _watched(
+                synthesize(prompt=prompt, model=req.model, stream_to_stdout=False),
+                phase=synth_phase,
+            ):
+                if kind == "progress":
+                    yield _sse("progress", payload)
+                else:
+                    idea = payload
         except Exception as e:
             yield _sse("error", {"message": f"synthesis failed: {e}"})
             return
+        assert idea is not None
 
         yield _sse("idea", {"i": i, "text": idea})
 
@@ -219,8 +274,23 @@ INDEX_HTML = r"""<!doctype html>
     border: 1px solid #e2e2e2; border-radius: 6px;
     padding: 0.9rem 1.1rem; margin-top: 0.9rem; background: #fafafa;
   }
-  .status { color: #555; font-style: italic; font-size: 0.92rem; }
-  .status::before { content: "● "; color: #999; }
+  .status { color: #555; font-size: 0.92rem; display: flex;
+            align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+  .status .dot {
+    width: 0.55rem; height: 0.55rem; border-radius: 50%;
+    background: #1a8a4f; flex: 0 0 auto;
+    animation: pulse 1.1s ease-in-out infinite;
+    transform: translateY(0.05rem);
+  }
+  .status.done .dot { background: #888; animation: none; }
+  .status.error .dot { background: #b00020; animation: none; }
+  .status .msg { font-style: italic; }
+  .status .elapsed { color: #888; font-family: ui-monospace, "SF Mono",
+                     Menlo, monospace; font-size: 0.85rem; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: translateY(0.05rem) scale(1); }
+    50%      { opacity: 0.35; transform: translateY(0.05rem) scale(0.7); }
+  }
   details { margin: 0; }
   summary { cursor: pointer; color: #444; font-size: 0.9rem; font-weight: 500; }
   details[open] summary { margin-bottom: 0.6rem; }
@@ -332,6 +402,8 @@ form.addEventListener('submit', async (e) => {
   if (!('regen_deck' in payload)) payload.regen_deck = false;
 
   out.innerHTML = '';
+  for (const k of Object.keys(statusByPhase)) delete statusByPhase[k];
+  for (const k of Object.keys(startByPhase)) delete startByPhase[k];
   btn.disabled = true;
   btn.textContent = 'Generating…';
   try {
@@ -366,6 +438,11 @@ form.addEventListener('submit', async (e) => {
   }
 });
 
+// Tracks the live status panel per phase so status/progress events can
+// update the same DOM node in place rather than appending new ones.
+const statusByPhase = {};
+const startByPhase = {};
+
 function handleEvent(chunk) {
   let event = 'message', data = '';
   for (const line of chunk.split('\n')) {
@@ -377,8 +454,15 @@ function handleEvent(chunk) {
   try { obj = JSON.parse(data); } catch (e) { return; }
 
   if (event === 'status') {
-    addPanel('<div class="status">' + escapeHtml(obj.message) + '</div>');
+    const phase = obj.phase || 'global';
+    startByPhase[phase] = performance.now();
+    upsertStatus(phase, obj.message);
+  } else if (event === 'progress') {
+    const phase = obj.phase || 'global';
+    updateElapsed(phase, obj.elapsed);
   } else if (event === 'deck') {
+    finishStatus('deck', 'deck ready: ' + obj.size + ' cards (depth=' +
+                 escapeHtml(obj.depth) + ')');
     const cardHtml = obj.cards.map(renderCard).join('');
     addPanel(
       '<details><summary>Donor deck — ' + obj.size +
@@ -394,14 +478,56 @@ function handleEvent(chunk) {
       cardHtml
     );
   } else if (event === 'idea') {
+    finishStatus('synth-' + obj.i, 'idea ' + (obj.i + 1) + ' ready');
     addPanel(
       '<div class="meta">Idea ' + (obj.i + 1) + '</div>' +
       '<div class="idea"><pre>' + escapeHtml(obj.text) + '</pre></div>'
     );
   } else if (event === 'done') {
-    addPanel('<div class="status">Done.</div>');
+    addPanel('<div class="status done"><span class="dot"></span>' +
+             '<span class="msg">Done.</span></div>');
   } else if (event === 'error') {
     addPanel('<div class="error">' + escapeHtml(obj.message) + '</div>');
+  }
+}
+
+function upsertStatus(phase, message) {
+  let panel = statusByPhase[phase];
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.className = 'panel';
+    panel.innerHTML =
+      '<div class="status">' +
+      '<span class="dot"></span>' +
+      '<span class="msg"></span>' +
+      '<span class="elapsed"></span>' +
+      '</div>';
+    out.appendChild(panel);
+    statusByPhase[phase] = panel;
+  }
+  panel.querySelector('.status').classList.remove('done', 'error');
+  panel.querySelector('.msg').textContent = message;
+  panel.querySelector('.elapsed').textContent = '';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'end' });
+}
+
+function updateElapsed(phase, elapsed) {
+  const panel = statusByPhase[phase];
+  if (!panel) return;
+  panel.querySelector('.elapsed').textContent =
+    'elapsed ' + Number(elapsed).toFixed(1) + 's';
+}
+
+function finishStatus(phase, finalMsg) {
+  const panel = statusByPhase[phase];
+  if (!panel) return;
+  const sd = panel.querySelector('.status');
+  sd.classList.add('done');
+  panel.querySelector('.msg').textContent = finalMsg;
+  if (startByPhase[phase]) {
+    const ms = performance.now() - startByPhase[phase];
+    panel.querySelector('.elapsed').textContent =
+      'took ' + (ms / 1000).toFixed(1) + 's';
   }
 }
 
