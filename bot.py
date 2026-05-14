@@ -78,6 +78,11 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     level=logging.INFO,
 )
+# httpx logs every request URL at INFO, which includes the bot token in the
+# Telegram API path. Silence it (and the lower-level httpcore) so the token
+# never reaches the journal.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("aidea.bot")
 
 
