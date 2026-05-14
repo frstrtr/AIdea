@@ -176,14 +176,16 @@ async def main() -> int:
         card_names = best_idea_cards(r)
         rag.record_winner(rid, card_names, total, source=r.get("source", ""))
         totals.append(total)
-        print(f"    score={total}/300  feas={score.get('feasibility')} "
-              f"unex={score.get('unexpectedness')} fit={score.get('topic_fit')}  "
+        print(f"    score={total}/400  feas={score.get('feasibility')} "
+              f"unex={score.get('unexpectedness')} "
+              f"uniq={score.get('uniqueness')} "
+              f"fit={score.get('topic_fit')}  "
               f"({len(card_names)} cards labeled)")
 
     if totals:
         avg = sum(totals) / len(totals)
         print()
-        print(f"Scored {len(totals)} runs. Mean total: {avg:.1f}/300 "
+        print(f"Scored {len(totals)} runs. Mean total: {avg:.1f}/400 "
               f"(min {min(totals)}, max {max(totals)}).")
 
     s = rag.stats()
