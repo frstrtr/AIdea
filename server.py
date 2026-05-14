@@ -117,6 +117,10 @@ def _card_to_dict(c: Card) -> dict:
 
 
 async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
+    from usage import start_run, summarize as usage_summarize
+    run_id = start_run("web")
+    yield _sse("run", {"run_id": run_id})
+
     modes_on = sum(1 for f in (req.einstein, req.lsd, req.futures) if f)
     if modes_on > 1:
         yield _sse("error", {
@@ -211,7 +215,6 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
     rng = random.Random(req.seed)
     ideas: list[str] = []
     mechanism_labels: list[str | None] = []
-    cards_per_idea: list[list[Card]] = []
     cards_per_idea: list[list[Card]] = []
 
     if req.einstein:
@@ -415,6 +418,11 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
                     ],
                 })
 
+    try:
+        yield _sse("usage", usage_summarize(run_id=run_id))
+    except Exception:
+        pass
+
     yield _sse("done", {})
 
 
@@ -443,6 +451,15 @@ async def meta():
             for d in CARD_DEPTHS
         ],
     }
+
+
+@app.get("/api/usage")
+async def usage_endpoint() -> dict:
+    """LLM usage summary: this-run is empty (no run scope on a bare GET),
+    last-7d / last-30d / total reflect the local usage.jsonl log, and
+    rate_limit reflects the most recently observed RateLimitEvent."""
+    from usage import summarize as usage_summarize
+    return usage_summarize(run_id=None)
 
 
 @app.post("/api/generate")
@@ -546,6 +563,31 @@ INDEX_HTML = r"""<!doctype html>
   }
   .mech-blurb { color: #666; font-size: 0.85rem; font-style: italic;
                 margin: 0.15rem 0 0.45rem; }
+  .panel.usage { position: sticky; bottom: 0.6rem; margin-top: 1.2rem;
+                 background: #fbfbf7; }
+  .usage-refresh { cursor: pointer; color: #888; margin-left: 0.4rem;
+                   font-size: 0.85rem; user-select: none; }
+  .usage-refresh:hover { color: #1a1a1a; }
+  .usage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                gap: 0.5rem; margin-top: 0.4rem; }
+  .usage-card { background: #fff; border: 1px solid #eee; border-radius: 6px;
+                padding: 0.45rem 0.6rem; font-size: 0.85rem;
+                font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .usage-card .label { color: #888; text-transform: uppercase;
+                       letter-spacing: 0.05em; font-size: 0.68rem;
+                       font-weight: 600; font-family: ui-sans-serif, system-ui; }
+  .usage-card .val { font-size: 1rem; margin-top: 0.15rem; }
+  .usage-card .sub { color: #888; font-size: 0.75rem; margin-top: 0.1rem; }
+  .usage-note { color: #888; font-size: 0.75rem; font-style: italic;
+                margin-top: 0.4rem; }
+  .usage-rate-ok { color: #1a8a4f; }
+  .usage-rate-warn { color: #b59500; }
+  .usage-rate-bad { color: #b03a2e; }
+  @media (prefers-color-scheme: dark) {
+    .panel.usage { background: #161616; }
+    .usage-card { background: #1a1a1a; border-color: #333; }
+    .usage-card .label, .usage-card .sub, .usage-note { color: #aaa; }
+  }
   .evolve-card { margin: 0.6rem 0; padding: 0.5rem 0.7rem;
                  border-left: 3px solid #1a8a4f; background: #f4faf6;
                  border-radius: 0 4px 4px 0; }
@@ -691,6 +733,11 @@ INDEX_HTML = r"""<!doctype html>
 </form>
 
 <div id="output"></div>
+
+<div id="usage-strip" class="panel usage" hidden>
+  <div class="meta">LLM usage <span id="usage-refresh" class="usage-refresh" title="Reload usage from log">↻</span></div>
+  <div id="usage-body"></div>
+</div>
 
 <script>
 const form = document.getElementById('form');
@@ -886,6 +933,10 @@ function handleEvent(chunk) {
       '<div class="meta refined-meta">Deck evolved (winner’s cards sharpened ' +
       'and written back to cache)</div>' + rows
     );
+  } else if (event === 'run') {
+    // captured for completeness; nothing to render
+  } else if (event === 'usage') {
+    renderUsage(obj);
   } else if (event === 'done') {
     addPanel('<div class="status done"><span class="dot"></span>' +
              '<span class="msg">Done.</span></div>');
@@ -961,6 +1012,95 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
+
+function fmtTokens(n) {
+  if (typeof n !== 'number' || isNaN(n)) return '0';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
+  return String(n);
+}
+function fmtMs(n) {
+  if (!n) return '0s';
+  if (n < 1000) return n + 'ms';
+  if (n < 60_000) return (n / 1000).toFixed(1) + 's';
+  return Math.floor(n / 60_000) + 'm ' + Math.round((n % 60_000) / 1000) + 's';
+}
+function fmtUsd(n) {
+  if (!n) return '$0.00';
+  if (n < 0.01) return '$' + n.toFixed(4);
+  return '$' + n.toFixed(2);
+}
+function usageCard(label, val, sub) {
+  return '<div class="usage-card"><div class="label">' + escapeHtml(label) +
+    '</div><div class="val">' + escapeHtml(val) + '</div>' +
+    (sub ? '<div class="sub">' + escapeHtml(sub) + '</div>' : '') +
+    '</div>';
+}
+function usageBucket(label, b) {
+  if (!b) return '';
+  const sub = (b.calls || 0) + ' call' + (b.calls === 1 ? '' : 's') +
+              ' · ' + fmtMs(b.duration_ms || 0) +
+              ' · ' + fmtUsd(b.total_cost_usd || 0);
+  return usageCard(label,
+                   fmtTokens(b.input_tokens || 0) + ' in / ' +
+                   fmtTokens(b.output_tokens || 0) + ' out',
+                   sub);
+}
+function renderUsage(u) {
+  const strip = document.getElementById('usage-strip');
+  const body = document.getElementById('usage-body');
+  if (!strip || !body) return;
+  strip.hidden = false;
+
+  let rateHtml = '';
+  if (u.rate_limit) {
+    const rl = u.rate_limit;
+    const status = rl.status || 'unknown';
+    const sev = status === 'allowed' ? 'ok' :
+                status === 'warning' ? 'warn' : 'bad';
+    let resets = '';
+    if (rl.resets_at) {
+      const dt = rl.resets_at - Date.now() / 1000;
+      if (dt > 0) {
+        const h = Math.floor(dt / 3600), m = Math.floor((dt % 3600) / 60);
+        resets = 'resets in ' + (h ? h + 'h ' : '') + m + 'm';
+      } else {
+        resets = 'reset due';
+      }
+    }
+    const util = (rl.utilization != null)
+      ? Math.round(rl.utilization * 100) + '%'
+      : '—';
+    rateHtml = usageCard(
+      'Subscription window (' + (rl.type || '?') + ')',
+      'status: ' + status + ', utilization ' + util,
+      resets
+    ).replace('class="label"',
+              'class="label usage-rate-' + sev + '"');
+  }
+
+  body.innerHTML =
+    '<div class="usage-grid">' +
+    usageBucket('This run', u.this_run) +
+    usageBucket('Last 7 days', u.last_7d) +
+    usageBucket('Last 30 days', u.last_30d) +
+    usageBucket('All time', u.total) +
+    usageCard('5h windows touched (last 7d)',
+              String(u.five_h_windows_last_7d || 0),
+              'local heuristic; not subscription truth') +
+    (rateHtml || '') +
+    '</div>' +
+    (u.note ? '<div class="usage-note">' + escapeHtml(u.note) + '</div>' : '');
+}
+
+async function loadUsage() {
+  try {
+    const r = await fetch('/api/usage');
+    if (r.ok) renderUsage(await r.json());
+  } catch (_) { /* ignore */ }
+}
+document.getElementById('usage-refresh').addEventListener('click', loadUsage);
+loadUsage();
 </script>
 </body>
 </html>"""

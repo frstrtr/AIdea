@@ -39,8 +39,16 @@ from pathlib import Path
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    RateLimitEvent,
+    ResultMessage,
     TextBlock,
     query,
+)
+
+from usage import (
+    build_call_record,
+    current_run_id,
+    record_call,
 )
 
 DECK_CACHE_DIR = Path(__file__).parent / "decks"
@@ -365,24 +373,12 @@ async def generate_deck(
     model: str,
     verbose: bool,
 ) -> list[Card]:
-    """One LLM call -> a topic-aware donor deck."""
-    options = ClaudeAgentOptions(
-        model=model,
-        system_prompt=DECK_GEN_SYSTEM,
-        max_turns=1,
-        allowed_tools=[],
-    )
+    """One LLM call -> a topic-aware donor deck. Usage recorded as kind='deck'."""
     prompt = _deck_gen_prompt(topic, n, depth)
 
-    chunks: list[str] = []
     if verbose:
         print(f"[deck] generating {n} cards at depth={depth.name}...", flush=True)
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    chunks.append(block.text)
-    text = "".join(chunks)
+    text = await _run_query(prompt, DECK_GEN_SYSTEM, model, kind="deck")
     cards = _parse_jsonl_cards(text, depth)
     if verbose:
         print(f"[deck] parsed {len(cards)} cards", flush=True)
@@ -923,21 +919,60 @@ SYNTHESIZER_SYSTEM = (
 )
 
 
-async def _query_text(prompt: str, system: str, model: str) -> str:
-    """One-shot inference call returning concatenated text."""
+async def _run_query(
+    prompt: str,
+    system: str,
+    model: str,
+    *,
+    kind: str,
+    stream_to_stdout: bool = False,
+) -> str:
+    """Drive one agent-SDK query: collect text, capture ResultMessage +
+    RateLimitEvent, write a usage record. Returns the concatenated assistant
+    text."""
     options = ClaudeAgentOptions(
         model=model,
         system_prompt=system,
         max_turns=1,
         allowed_tools=[],
     )
+
     chunks: list[str] = []
+    rate_limit_info = None
+    result_message = None
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock):
                     chunks.append(block.text)
+                    if stream_to_stdout:
+                        print(block.text, end="", flush=True)
+        elif isinstance(message, ResultMessage):
+            result_message = message
+        elif isinstance(message, RateLimitEvent):
+            rate_limit_info = message.rate_limit_info
+
+    if stream_to_stdout:
+        print()
+
+    # Record usage. Tolerate the case where the SDK didn't emit a
+    # ResultMessage (extremely rare; never block the pipeline on logging).
+    if result_message is not None:
+        try:
+            record_call(build_call_record(
+                run_id=current_run_id() or "unknown",
+                kind=kind,
+                result_message=result_message,
+                rate_limit_info=rate_limit_info,
+            ))
+        except Exception:
+            pass
+
     return "".join(chunks)
+
+
+async def _query_text(prompt: str, system: str, model: str, *, kind: str = "misc") -> str:
+    return await _run_query(prompt, system, model, kind=kind)
 
 
 async def synthesize(
@@ -946,25 +981,10 @@ async def synthesize(
     stream_to_stdout: bool,
 ) -> str:
     """Run the inference engine via the agent SDK (inherits CLI auth)."""
-    options = ClaudeAgentOptions(
-        model=model,
-        system_prompt=SYNTHESIZER_SYSTEM,
-        max_turns=1,
-        allowed_tools=[],
+    return await _run_query(
+        prompt, SYNTHESIZER_SYSTEM, model,
+        kind="synth", stream_to_stdout=stream_to_stdout,
     )
-
-    chunks: list[str] = []
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    chunks.append(block.text)
-                    if stream_to_stdout:
-                        print(block.text, end="", flush=True)
-
-    if stream_to_stdout:
-        print()
-    return "".join(chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -1027,7 +1047,7 @@ def _try_parse_json_object(raw: str) -> dict | None:
 async def critic_score(topic: str, idea: str, model: str) -> dict:
     """Return {feasibility, unexpectedness, topic_fit, notes} (ints clipped 0-100)."""
     prompt = CRITIC_PROMPT_TEMPLATE.format(topic=topic.strip(), idea=idea.strip())
-    raw = await _query_text(prompt, CRITIC_SYSTEM, model)
+    raw = await _query_text(prompt, CRITIC_SYSTEM, model, kind="critic")
     obj = _try_parse_json_object(raw) or {}
 
     def _clip(v: object) -> int:
@@ -1090,7 +1110,7 @@ async def refine_idea(
         idea=idea.strip(),
         notes=notes.strip() or "no specific critique provided",
     )
-    return await _query_text(prompt, SYNTHESIZER_SYSTEM, model)
+    return await _query_text(prompt, SYNTHESIZER_SYSTEM, model, kind="refine")
 
 
 # ---------------------------------------------------------------------------
@@ -1161,7 +1181,7 @@ async def evolve_cards(
         fields_list=fields_list or "(none for shallow depth)",
         fields_list_quoted=fields_list_quoted,
     )
-    raw = await _query_text(prompt, DECK_EVOLVE_SYSTEM, model)
+    raw = await _query_text(prompt, DECK_EVOLVE_SYSTEM, model, kind="evolve")
     new_cards = _parse_jsonl_cards(raw, depth)
 
     # Match by case-insensitive name; drop any model-invented entries.
@@ -1433,6 +1453,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 async def run_pipeline(args: argparse.Namespace) -> int:
+    from usage import start_run
+    run_id = start_run("cli")
+    if not args.quiet:
+        print(f"[usage] run_id={run_id}", file=sys.stderr)
     spread, level = parse_entropy(args.entropy)
     depth = CARD_DEPTH_BY_NAME[args.card_depth]
 

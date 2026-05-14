@@ -13,6 +13,7 @@ env/
 # Generated/cached donor decks (Claude output, regenerable, may contain
 # user-specific topic text). Remove this line if you want decks tracked.
 decks/
+usage.jsonl
 
 # Editor / OS
 .vscode/

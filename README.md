@@ -141,6 +141,48 @@ prompt size. Cards are generated once per `(topic, cards, depth, model)`
 combination and cached in `decks/` as JSON; subsequent runs hit the
 cache.
 
+## Telegram bot
+
+```bash
+export TELEGRAM_BOT_TOKEN=<token from @BotFather>
+.venv/bin/python bot.py
+```
+
+Same pipeline, exposed over Telegram chat. Commands:
+
+| Command | What it does |
+|---|---|
+| `/idea <topic>` | One idea at the current entropy |
+| `/einstein <topic>` | Four mechanism-specific ideas (Adjacent Possible · Exaptation · Slow Hunch · Productive Error) |
+| `/lsd <topic>` | Prior dissolution — re-perceive under a different frame |
+| `/futures <topic>` | Temporal projection (+1y · +3y · +10y · +30y) |
+| `/settings` | Show entropy / cards / card-depth / refine / evolve knobs |
+| `/set k=v` | Tune one knob (entropy / cards / card_depth / n_concepts / n_ideas / refine / evolve_deck / seed / model) |
+| `/usage` | LLM usage summary + observed subscription-window state |
+| `/cancel` | Abort the in-flight task in this chat |
+
+Progress is delivered by editing a single "working…" message every ~1.5s,
+so long synthesis runs don't spam the chat. Ideas longer than Telegram's
+4096-char cap are split on paragraph boundaries.
+
+The bot inherits its model auth from whatever the agent CLI is logged in
+against — same auth model as the web app.
+
+## Usage tracking
+
+Every LLM call writes one record to `usage.jsonl`: tokens (input / output /
+cache hits), duration, USD-equivalent cost, primary model, and the most
+recently observed rate-limit window from the agent SDK's `RateLimitEvent`.
+
+Both surfaces expose it:
+
+- **Web**: a sticky usage panel at the bottom of the page shows this-run,
+  7-day, 30-day, and all-time totals. The "Subscription window" card
+  reflects the actual rate-limit type and reset time from the SDK; the
+  "5h windows touched (last 7d)" card is a local heuristic and labelled
+  as such. `GET /api/usage` returns the same payload as JSON.
+- **Telegram**: `/usage` prints the equivalent summary in chat.
+
 ## Project layout
 
 ```
@@ -148,9 +190,13 @@ aidea.py          # Library + CLI: deck generation, sampling, synthesis,
                   # critic, refinement, all assembled in run_pipeline().
 server.py         # FastAPI app + inline single-page UI; SSE stream of
                   # status / progress / deck / sample / idea / score /
-                  # winner / refined / done / error events.
+                  # winner / refined / evolved / usage / done / error.
+bot.py            # Telegram bot binding the same pipeline.
+usage.py          # JSONL usage log + summarizer (this-run / 7d / 30d
+                  # + real rate-limit window from the SDK).
 requirements.txt
 decks/            # Per-topic donor-deck cache (gitignored).
+usage.jsonl       # Per-call usage log (gitignored).
 ```
 
 ## License
