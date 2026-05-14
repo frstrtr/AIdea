@@ -17,7 +17,7 @@ Quality signal: each ingested card carries provenance (topic / run_id /
 mode / source). When a refine pass picks a winner, ``record_winner()``
 links the winning idea's contributing cards to their ``critic_total``
 score. At retrieval time, candidates are ranked by
-``bm25_score * (1 + critic_total / 300)`` so proven winners surface
+``bm25_score * (1 + critic_total / 400)`` so proven winners surface
 preferentially. Unscored cards rank by similarity alone — the corpus
 self-evolves as more refine runs accumulate.
 
@@ -339,9 +339,9 @@ def _load_corpus(source: str | None = None) -> list[dict[str, Any]]:
 def _load_outcomes() -> dict[str, int]:
     """Map run_id -> combined quality signal for that run.
 
-    Combines the critic's winner score (0..300, kept as max if duplicated)
+    Combines the critic's winner score (0..400, kept as max if duplicated)
     with explicit user feedback (additive: +50 "useful", -100 "not useful").
-    Clamped to [-300, 300] so a single noisy signal can't dominate. Feedback
+    Clamped to [-400, 400] so a single noisy signal can't dominate. Feedback
     overrides the critic on negative ("user says it's broken" wins over
     "critic gave it a 220"), reinforces on positive.
     """
@@ -374,7 +374,7 @@ def _load_outcomes() -> dict[str, int]:
     combined: dict[str, int] = {}
     for rid in set(winner_max) | set(feedback_sum):
         v = winner_max.get(rid, 0) + feedback_sum.get(rid, 0)
-        combined[rid] = max(-300, min(300, v))
+        combined[rid] = max(-400, min(400, v))
     return combined
 
 
@@ -450,11 +450,11 @@ def retrieve_similar(
         overlap = len(query_set.intersection(doc))
         if overlap == 0:
             continue
-        # Combined critic + feedback signal in [-300, +300].
+        # Combined critic + feedback signal in [-400, +400].
         total = outcomes.get(rec.get("run_id"))
         if isinstance(total, (int, float)):
-            # total=-300 -> 0.0 (effectively filtered), 0 -> 1.0, +300 -> 2.0
-            boost = max(0.0, 1.0 + float(total) / 300.0)
+            # total=-400 -> 0.0 (effectively filtered), 0 -> 1.0, +400 -> 2.0
+            boost = max(0.0, 1.0 + float(total) / 400.0)
         else:
             boost = 1.0
         boosted.append((s * boost, rec))

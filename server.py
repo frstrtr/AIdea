@@ -73,7 +73,7 @@ class GenerateRequest(BaseModel):
     cards: int = Field(30, ge=4, le=500)
     card_depth: str = "medium"
     n_concepts: int = Field(3, ge=2, le=10)
-    n_ideas: int = Field(1, ge=1, le=5)
+    n_ideas: int = Field(3, ge=1, le=5)
     seed: int | None = None
     model: str = "claude-opus-4-7"
     regen_deck: bool = False
@@ -423,16 +423,20 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             mechanism_labels.append(mech_label)
         cards_per_idea.append(cards)
 
-    # --- Stage 3: critic + refinement (optional) --------------------------
-    if req.refine and ideas:
+    # --- Stage 3: critic (always when applicable) + refine (opt-in) --------
+    # Score every idea on feasibility / unexpectedness / uniqueness / topic
+    # fit so the user sees a full breakdown per idea. Skipped for the
+    # feasibility-off modes (dream / lucid) where the axes don't apply.
+    score_enabled = not (req.dream or req.lucid) and bool(ideas)
+    scored: list[dict] = []
+    if score_enabled:
         yield _sse("status", {
             "phase": "critic",
             "message": (
                 f"Scoring {len(ideas)} idea(s) on feasibility / "
-                f"unexpectedness / topic fit..."
+                f"unexpectedness / uniqueness / topic fit..."
             ),
         })
-        scored: list[dict] = []
         for i, idea in enumerate(ideas):
             score: dict | None = None
             try:
@@ -461,11 +465,15 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
                 mechanism=score.get("mechanism"),
                 feasibility=score.get("feasibility"),
                 unexpectedness=score.get("unexpectedness"),
+                uniqueness=score.get("uniqueness"),
                 topic_fit=score.get("topic_fit"),
                 total=score.get("total"),
                 notes=score.get("notes", ""),
             )
 
+    # Record best idea as RAG winner regardless of refine flag — the score
+    # data is already paid for and the corpus benefits from every run.
+    if scored:
         winner = max(scored, key=lambda s: s["total"])
         yield _sse("winner", {
             "i": winner["i"],
@@ -492,6 +500,7 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         except Exception:
             pass
 
+    if req.refine and scored:
         yield _sse("status", {
             "phase": "refine",
             "message": (
@@ -1010,7 +1019,7 @@ INDEX_HTML = r"""<!doctype html>
       <input type="number" name="n_concepts" value="3" min="2" max="10">
     </label>
     <label>Ideas
-      <input type="number" name="n_ideas" value="1" min="1" max="5">
+      <input type="number" name="n_ideas" value="3" min="1" max="5">
     </label>
     <label>Seed (optional)
       <input type="number" name="seed" placeholder="empty = random">
@@ -1263,7 +1272,7 @@ function handleEvent(chunk) {
     );
   } else if (event === 'score') {
     finishStatus('critic-' + obj.i,
-                 'idea ' + (obj.i + 1) + ' scored ' + obj.total + '/300');
+                 'idea ' + (obj.i + 1) + ' scored ' + obj.total + '/400');
     const mechTag = obj.mechanism
       ? '<span class="mech-tag' + (
           obj.mechanism && obj.mechanism.indexOf('LSD') === 0 ? ' lsd' :
@@ -1278,8 +1287,9 @@ function handleEvent(chunk) {
       '<div class="score-row">' +
         '<span class="score-pill">feasibility ' + obj.feasibility + '</span>' +
         '<span class="score-pill">unexpectedness ' + obj.unexpectedness + '</span>' +
+        '<span class="score-pill">uniqueness ' + obj.uniqueness + '</span>' +
         '<span class="score-pill">topic-fit ' + obj.topic_fit + '</span>' +
-        '<span class="score-pill total">total ' + obj.total + '/300</span>' +
+        '<span class="score-pill total">total ' + obj.total + '/400</span>' +
       '</div>' +
       (obj.notes ? '<div class="critic-notes">' + escapeHtml(obj.notes) + '</div>' : '')
     );
@@ -1290,7 +1300,7 @@ function handleEvent(chunk) {
     addPanel(
       '<div class="meta">Winner</div>' +
       '<div class="winner-banner">Idea ' + (obj.i + 1) +
-      ' wins with ' + obj.total + '/300' + mechSuffix + '</div>' +
+      ' wins with ' + obj.total + '/400' + mechSuffix + '</div>' +
       (obj.notes ? '<div class="critic-notes">' + escapeHtml(obj.notes) + '</div>' : '')
     );
   } else if (event === 'refined') {

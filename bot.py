@@ -98,7 +98,7 @@ class ChatSettings:
     cards: int = 30
     card_depth: str = "medium"
     n_concepts: int = 3
-    n_ideas: int = 1
+    n_ideas: int = 3
     model: str = "claude-opus-4-7"
     refine: bool = False
     evolve_deck: bool = False
@@ -193,12 +193,12 @@ def fmt_usd(n: float) -> str:
 # Rough order-of-magnitude — refined as soon as a few real runs of that mode
 # land in the history.
 _ETA_FALLBACK: dict[str, float] = {
-    "default": 80.0,
-    "einstein": 150.0,
-    "lsd": 110.0,
-    "futures": 150.0,
-    "dream": 70.0,
-    "lucid": 70.0,
+    "default": 180.0,  # 3 syntheses + 3 critic passes + deck
+    "einstein": 220.0,  # 4 mechanism passes + 4 critic + deck
+    "lsd": 200.0,  # 3 × (anarchic + sober) + 3 critic + deck
+    "futures": 220.0,  # 4 horizon passes + 4 critic + deck
+    "dream": 110.0,  # 3 dreams, no critic (feasibility-off mode)
+    "lucid": 110.0,  # 3 lucid dreams, no critic
 }
 
 
@@ -508,9 +508,13 @@ async def run_pipeline_for_telegram(
                 cards_per_idea.append(drawn)
                 mech_labels.append(label)
 
-        # Stage 3: critic + refine
-        if s.refine and ideas:
-            scored: list[dict] = []
+        # Stage 3: critic — score every idea by default so the user sees a
+        # 4-axis breakdown (feasibility / unexpectedness / uniqueness /
+        # topic_fit) per idea. Skipped only for feasibility-off modes
+        # (dream / lucid) where the axes don't map cleanly.
+        score_enabled = mode not in ("dream", "lucid")
+        scored: list[dict] = []
+        if score_enabled and ideas:
             for i, idea in enumerate(ideas):
                 score = await run_with_progress(
                     critic_score(topic, idea, s.model),
@@ -525,6 +529,7 @@ async def run_pipeline_for_telegram(
                     mechanism=mech_labels[i] if i < len(mech_labels) else None,
                     feasibility=score.get("feasibility"),
                     unexpectedness=score.get("unexpectedness"),
+                    uniqueness=score.get("uniqueness"),
                     topic_fit=score.get("topic_fit"),
                     total=score.get("total"),
                     notes=score.get("notes", ""),
@@ -536,12 +541,17 @@ async def run_pipeline_for_telegram(
                         + (f" [{mech_labels[i]}]" if mech_labels[i] else "")
                         + f": feasibility={score['feasibility']}, "
                         f"unexpectedness={score['unexpectedness']}, "
+                        f"uniqueness={score['uniqueness']}, "
                         f"topic-fit={score['topic_fit']}, "
-                        f"total={score['total']}/300\n"
+                        f"total={score['total']}/400\n"
                         f"notes: {score.get('notes', '')}"
                     ),
                 )
 
+        # Record the best-scoring idea as a RAG winner regardless of refine
+        # flag — the score data is already paid for; capturing it costs
+        # nothing and keeps the corpus self-evolving from every run.
+        if scored:
             winner = max(scored, key=lambda x: x["total"])
             wmech = mech_labels[winner["i"]] if mech_labels[winner["i"]] else ""
             transcript_log(
@@ -562,26 +572,28 @@ async def run_pipeline_for_telegram(
                 )
             except Exception:
                 pass
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🏆 Winner: idea {winner['i'] + 1}"
-                    + (f" [{wmech}]" if wmech else "")
-                    + f" — {winner['total']}/300. Refining at low entropy..."
-                ),
-            )
-            refined = await run_with_progress(
-                refine_idea(
-                    topic=topic,
-                    idea=ideas[winner["i"]],
-                    notes=winner.get("notes", ""),
-                    model=s.model,
-                ),
-                update=update, context=context, cancel=state.cancel,
-                headline="refining winner",
-            )
-            transcript_log("refined", i=winner["i"], text=refined)
-            await send_idea(update, context, "Refined winner", refined)
+
+            if s.refine:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🏆 Best so far: idea {winner['i'] + 1}"
+                        + (f" [{wmech}]" if wmech else "")
+                        + f" — {winner['total']}/400. Refining at low entropy..."
+                    ),
+                )
+                refined = await run_with_progress(
+                    refine_idea(
+                        topic=topic,
+                        idea=ideas[winner["i"]],
+                        notes=winner.get("notes", ""),
+                        model=s.model,
+                    ),
+                    update=update, context=context, cancel=state.cancel,
+                    headline="refining winner",
+                )
+                transcript_log("refined", i=winner["i"], text=refined)
+                await send_idea(update, context, "Refined winner", refined)
 
         # Final usage summary
         u = summarize(run_id=run_id)

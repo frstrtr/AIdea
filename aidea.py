@@ -778,6 +778,12 @@ How it addresses the request: <2-3 sentences — be concrete about which
   aspect of the user's problem this targets>
 Mechanism: <2-4 sentences — name which donor concept(s) supply the
   structure and how the borrowing actually works>
+Where it has worked: <1-2 sentences citing a concrete prior case — name
+  the field, organization, or product where this mechanism (the donor's,
+  not this exact transplant) has been observed working. Pull from the
+  donor's "Prior application" line above when available; otherwise cite
+  a real published case from the donor's source field. This is the
+  "proven" half of the unique+proven pairing — be specific, not generic>
 Why it's unexpected: <1-2 sentences>
 First step the user could take this week: <one concrete action>
 Risks / what could break: <1-2 sentences naming the most likely failure
@@ -1596,7 +1602,7 @@ The user is working on this problem:
 
   {topic}
 
-Score this idea on three axes from 0 to 100. Be honest — your job is to
+Score this idea on four axes from 0 to 100. Be honest — your job is to
 differentiate good ideas from filler, so use the full range. Reserve 90+
 for genuinely strong, reserve 0-20 for clearly weak; cluster the middle.
 
@@ -1605,6 +1611,17 @@ for genuinely strong, reserve 0-20 for clearly weak; cluster the middle.
     fiction.
   - unexpectedness: how non-obvious is the structural choice? 100 = "I did
     not see that coming"; 0 = "I would have thought of this in 30 seconds".
+  - uniqueness: is this approach genuinely new TO THE USER'S STATED FIELD,
+    or is it already a well-known/published/textbook solution there? Use
+    your training-data knowledge of prior art in that specific field as the
+    baseline. 100 = no evidence this exact transplant has been done in this
+    field; 0 = this is the standard textbook approach you'd find on page 1
+    of any introductory resource for that field. IMPORTANT: a transplant of
+    a mechanism from another field counts as NEW in the user's field even
+    if the donor mechanism is well-established in its origin field — what
+    counts is novelty in the USER's domain, not the donor's. If the idea
+    is a generic restatement of a common pattern in the user's field,
+    score low even if the wording is fresh.
   - topic_fit: does this address the user's stated problem (vs a tangent)?
     100 = bullseye; 0 = answers a different question.
 
@@ -1614,8 +1631,8 @@ Idea to score:
 
 Respond as ONE JSON object only, with these keys exactly:
   {{"feasibility": <int 0-100>, "unexpectedness": <int 0-100>,
-    "topic_fit": <int 0-100>, "notes": "<one sentence — what's strongest,
-    what's weakest>"}}
+    "uniqueness": <int 0-100>, "topic_fit": <int 0-100>,
+    "notes": "<one sentence — what's strongest, what's weakest>"}}
 """
 
 
@@ -1651,15 +1668,25 @@ async def critic_score(topic: str, idea: str, model: str) -> dict:
     return {
         "feasibility": _clip(obj.get("feasibility")),
         "unexpectedness": _clip(obj.get("unexpectedness")),
+        "uniqueness": _clip(obj.get("uniqueness")),
         "topic_fit": _clip(obj.get("topic_fit")),
         "notes": str(obj.get("notes", "")).strip()[:500],
     }
+
+
+# Maximum value of total_score. Used as the divisor for the RAG retrieval
+# boost (rag.py) so the boost saturates at the right place when all axes
+# are maxed. Bumped from 300 → 400 with the addition of the uniqueness
+# axis. Old outcome records max at 300; their boost just won't fully
+# saturate, which is acceptable for a gentle transition.
+CRITIC_TOTAL_MAX = 400
 
 
 def total_score(score: dict) -> int:
     return (
         score.get("feasibility", 0)
         + score.get("unexpectedness", 0)
+        + score.get("uniqueness", 0)
         + score.get("topic_fit", 0)
     )
 
@@ -1892,7 +1919,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--n-ideas",
         type=int,
-        default=1,
+        default=3,
         help="How many independent ideas to generate this run.",
     )
     p.add_argument(
