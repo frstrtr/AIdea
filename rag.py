@@ -316,10 +316,13 @@ def retrieve_similar(
     for rec, s in zip(corpus, scores):
         if s <= 0:
             continue
-        boost = 1.0
+        # Combined critic + feedback signal in [-300, +300].
         total = outcomes.get(rec.get("run_id"))
-        if isinstance(total, (int, float)) and total > 0:
-            boost = 1.0 + (float(total) / 300.0)  # up to 2× for a 300/300 winner
+        if isinstance(total, (int, float)):
+            # total=-300 -> 0.0 (effectively filtered), 0 -> 1.0, +300 -> 2.0
+            boost = max(0.0, 1.0 + float(total) / 300.0)
+        else:
+            boost = 1.0
         boosted.append((s * boost, rec))
 
     boosted.sort(key=lambda x: -x[0])

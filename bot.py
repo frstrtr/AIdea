@@ -275,6 +275,7 @@ async def run_pipeline_for_telegram(
     state.busy = True
     state.cancel.clear()
     run_id = start_run(f"tg-{chat_id}")
+    state.last_run_id = run_id  # /feedback targets this run by default
     set_source(f"telegram-{chat_id}")
     s = state.settings
     spread, level = parse_entropy(s.entropy)
@@ -847,6 +848,56 @@ async def cmd_usage(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_feedback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Explicit user-feedback signal targeting the last completed run.
+
+    Usage:
+      /feedback useful [optional comment]
+      /feedback bad    [optional comment]
+
+    Stored in card_outcomes.jsonl as a synthetic critic_total (+50 for
+    useful, -100 for bad) so the next deck-gen retrieval re-ranks
+    accordingly. Source-scoped — only affects this chat's RAG memory.
+    """
+    chat_id = update.effective_chat.id
+    state = state_for(chat_id)
+    parts = (update.message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Usage:\n"
+            "  /feedback useful [comment]\n"
+            "  /feedback bad [comment]\n"
+            "Targets the last completed run in this chat."
+        )
+        return
+    verdict = parts[1].strip().lower()
+    comment = parts[2].strip() if len(parts) > 2 else ""
+    if verdict not in {"useful", "good", "yes", "+", "👍",
+                        "bad", "useless", "no", "-", "👎"}:
+        await update.message.reply_text(
+            "First arg must be 'useful' or 'bad'."
+        )
+        return
+    useful = verdict in {"useful", "good", "yes", "+", "👍"}
+    if not state.last_run_id:
+        await update.message.reply_text(
+            "No run in this chat to attach feedback to yet."
+        )
+        return
+    from rag import record_feedback
+    record_feedback(
+        run_id=state.last_run_id,
+        useful=useful,
+        comment=comment,
+        source=f"telegram-{chat_id}",
+    )
+    label = "👍 useful" if useful else "👎 not useful"
+    await update.message.reply_text(
+        f"{label} recorded for run {state.last_run_id}. "
+        "This will reweight future retrievals in this chat."
+    )
+
+
 async def cmd_corpus(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show RAG-corpus stats for this chat (per-source-scoped)."""
     from rag import stats as rag_stats, format_stats_text
@@ -904,6 +955,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("corpus", cmd_corpus))
+    app.add_handler(CommandHandler("feedback", cmd_feedback))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_fallback))
     return app
