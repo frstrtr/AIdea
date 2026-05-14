@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated/cached donor decks (Claude output, regenerable, may contain
+# user-specific topic text). Remove this line if you want decks tracked.
+decks/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
