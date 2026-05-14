@@ -104,6 +104,7 @@ class ChatState:
     settings: ChatSettings = field(default_factory=ChatSettings)
     busy: bool = False
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    last_run_id: str | None = None  # target of /feedback when no id is passed
 
 
 # chat_id -> ChatState
@@ -445,6 +446,18 @@ async def run_pipeline_for_telegram(
                 mechanism=mech_labels[winner["i"]],
                 notes=winner.get("notes", ""),
             )
+            try:
+                from rag import record_winner as _rag_record_winner
+                _rag_record_winner(
+                    run_id=run_id,
+                    winning_card_names=[
+                        c.name for c in cards_per_idea[winner["i"]]
+                    ],
+                    critic_total=int(winner["total"]),
+                    source=f"telegram-{chat_id}",
+                )
+            except Exception:
+                pass
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -834,6 +847,22 @@ async def cmd_usage(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_corpus(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show RAG-corpus stats for this chat (per-source-scoped)."""
+    from rag import stats as rag_stats, format_stats_text
+    chat_id = update.effective_chat.id
+    source = f"telegram-{chat_id}"
+    s = rag_stats(source=source)
+    text = format_stats_text(s)
+    note = (
+        "\n\nRAG retrieves donor concepts that worked for your past topics in "
+        "THIS chat and uses them to warm-start the next deck. Privacy-scoped: "
+        "no cross-chat leakage. Quality boost activates after at least one "
+        "refine-winner is recorded."
+    )
+    await update.message.reply_text(text + note)
+
+
 async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = state_for(update.effective_chat.id)
     if not state.busy:
@@ -874,6 +903,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("usage", cmd_usage))
+    app.add_handler(CommandHandler("corpus", cmd_corpus))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_fallback))
     return app

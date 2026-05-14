@@ -409,6 +409,7 @@ def _deck_gen_prompt(
     n: int,
     depth: CardDepth,
     themes: list[str] | None = None,
+    warm_start: str = "",
 ) -> str:
     field_list = ", ".join(f'"{f}"' for f in depth.fields)
     if themes:
@@ -431,13 +432,28 @@ def _deck_gen_prompt(
             "history, music, warfare, religion, law, sports, etc.)."
         )
         spread_clause = "- Span at least 8 distinct source domains."
+    warm_block = ""
+    if warm_start.strip():
+        warm_block = f"""\
+
+Warm-start examples — donor concepts that have produced ideas before in
+THIS USER'S problem space (retrieved from their own past sessions; never
+from another user's). Use them as a SIGNAL for which kinds of mechanism
+transfer well here. Generate FRESH cards with the same generalizing
+spirit. You may include a card with the same name as a warm-start card
+ONLY if you sharpen its mechanism / why / transfer fields with new
+insight; otherwise pick a different angle. Do not include all of them —
+treat the list as informative, not mandatory.
+
+{warm_start}
+"""
     return f"""\
 Generate {n} donor concepts that could cross-pollinate with this user topic:
 
   {topic.strip()}
 
 {domains_clause}
-
+{warm_block}
 Optimize for STRUCTURAL diversity. Aim for concepts whose mechanisms are
 domain-independent enough to be transferable, not concepts that already
 live near the user's topic.
@@ -558,7 +574,32 @@ async def generate_deck(
         except Exception:
             pass
 
-    prompt = _deck_gen_prompt(topic, n, depth, themes=themes or None)
+    # ---- RAG: retrieve past donor cards proven useful in this source's
+    # problem space, scoped per-source for privacy. The synthesizer never
+    # sees retrieval — only the deck-gen prompt does — so the entropy
+    # mechanism stays clean.
+    warm_block = ""
+    try:
+        from rag import retrieve_similar, render_warm_start
+        from transcripts import current_source
+        src = current_source() or "unknown"
+        retrieved = retrieve_similar(source=src, topic=topic, k=8)
+        warm_block = render_warm_start(retrieved)
+        if verbose and retrieved:
+            names = ", ".join(
+                (r.get("card") or {}).get("name", "?") for r in retrieved[:5]
+            )
+            print(
+                f"[deck] warm-start from corpus: {len(retrieved)} card(s) — "
+                f"{names}{'...' if len(retrieved) > 5 else ''}",
+                flush=True,
+            )
+    except Exception:
+        warm_block = ""
+
+    prompt = _deck_gen_prompt(
+        topic, n, depth, themes=themes or None, warm_start=warm_block,
+    )
 
     if verbose:
         print(f"[deck] generating {n} cards at depth={depth.name}...", flush=True)
@@ -566,6 +607,26 @@ async def generate_deck(
     cards = _parse_jsonl_cards(text, depth)
     if verbose:
         print(f"[deck] parsed {len(cards)} cards", flush=True)
+
+    # Ingest into per-source corpus for future runs to retrieve from.
+    try:
+        from rag import ingest_deck
+        from transcripts import current_source
+        from usage import current_run_id
+        n_ingested = ingest_deck(
+            source=current_source() or "unknown",
+            run_id=current_run_id() or "unknown",
+            topic=topic,
+            cards=cards,
+            mode="default",  # mode at deck-gen is "default"; idea-time mode varies
+        )
+        if verbose and n_ingested:
+            print(
+                f"[deck] ingested {n_ingested} card(s) into RAG corpus",
+                flush=True,
+            )
+    except Exception:
+        pass
     return cards
 
 
@@ -2374,6 +2435,23 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             mechanism=mechanisms_used[winner["i"]] if winner["i"] < len(mechanisms_used) else None,
             notes=winner.get("notes", ""),
         )
+        # RAG: link the winning cards back to their critic_total so future
+        # retrievals can boost them.
+        try:
+            from rag import record_winner as _rag_record_winner
+            from transcripts import current_source
+            from usage import current_run_id
+            winning_card_names = [
+                c.name for c in cards_per_idea[winner["i"]]
+            ]
+            _rag_record_winner(
+                run_id=current_run_id() or "unknown",
+                winning_card_names=winning_card_names,
+                critic_total=total_score(winner),
+                source=current_source() or "unknown",
+            )
+        except Exception:
+            pass
         print(
             f"\n=== Winner: idea {winner['i'] + 1}{winner_mech} "
             f"(total {total_score(winner)}) — refining at low entropy ===\n"

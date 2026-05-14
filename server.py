@@ -474,6 +474,18 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             mechanism=winner.get("mechanism"),
             notes=winner.get("notes", ""),
         )
+        try:
+            from rag import record_winner as _rag_record_winner
+            _rag_record_winner(
+                run_id=run_id,
+                winning_card_names=[
+                    c.name for c in cards_per_idea[winner["i"]]
+                ],
+                critic_total=int(winner["total"]),
+                source="web",
+            )
+        except Exception:
+            pass
 
         yield _sse("status", {
             "phase": "refine",
@@ -598,6 +610,15 @@ async def usage_endpoint() -> dict:
     rate_limit reflects the most recently observed RateLimitEvent."""
     from usage import summarize as usage_summarize
     return usage_summarize(run_id=None)
+
+
+@app.get("/api/corpus")
+async def corpus_endpoint(source: str | None = None) -> dict:
+    """RAG corpus health: card count, sources, modes, quality-labelled
+    fraction. ``?source=...`` returns the tenant-scoped view; omitting
+    returns the aggregate."""
+    from rag import stats as rag_stats
+    return rag_stats(source=source)
 
 
 @app.post("/api/generate")
