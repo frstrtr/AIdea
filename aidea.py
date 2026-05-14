@@ -311,6 +311,12 @@ class Card:
     transfer: str | None = None
     invariants: str | None = None
     prior_application: str | None = None
+    # 0-100 structural-alignment score to the current topic. Populated by
+    # score_alignment() when AIDEA_STRUCTURE_BIAS is on; left None otherwise.
+    # When present, sample_cards uses it to weight within-domain selection
+    # so high-aligned cards rise, mimicking the brain's structure-mapping
+    # bias (Gentner) on top of the entropy radius.
+    alignment_score: int | None = None
 
     def render(self) -> str:
         """Render the card for the synthesizer prompt."""
@@ -682,6 +688,29 @@ async def load_or_generate_deck(
         if verbose:
             print(f"[deck] cached {len(cards)} cards to {path}", flush=True)
 
+    # Optional brain-inspired structural-alignment scoring (Gentner
+    # structure-mapping). When AIDEA_STRUCTURE_BIAS is on, score every
+    # card 0-100 on whether its core mechanism actually maps onto the
+    # user's problem, then attach the score so sample_cards can use
+    # weighted within-domain selection instead of uniform random.
+    if os.environ.get("AIDEA_STRUCTURE_BIAS", "").strip() not in ("", "0", "false", "False"):
+        try:
+            scores = await score_alignment(topic, cards, model)
+            for c in cards:
+                c.alignment_score = scores.get(c.name)
+            if verbose:
+                vals = [s for s in scores.values()]
+                if vals:
+                    print(
+                        f"[deck] structural alignment scored: "
+                        f"mean {sum(vals)/len(vals):.0f} · "
+                        f"range {min(vals)}–{max(vals)}",
+                        flush=True,
+                    )
+        except Exception as e:
+            if verbose:
+                print(f"[deck] alignment scoring failed ({e}); falling back to uniform sampling", flush=True)
+
     # Ingest into the per-source corpus on every pipeline run, including
     # cache hits — the deck cache is keyed by topic/depth/model and is
     # source-agnostic, so a new source reusing a cached deck still needs
@@ -722,9 +751,37 @@ def sample_cards(
     spread: float,
     rng: random.Random,
 ) -> list[Card]:
-    """Sample n cards with controlled cross-domain spread."""
+    """Sample n cards with controlled cross-domain spread.
+
+    Within each chosen domain, if the deck's cards carry
+    ``alignment_score`` (populated by ``score_alignment`` when
+    AIDEA_STRUCTURE_BIAS is on), selection is weighted by that score
+    blended against entropy: at low ``spread`` alignment dominates
+    (tight transplants); at high ``spread`` the weights flatten toward
+    uniform so AIdea's signature surprise isn't smothered. Domain-
+    hopping at rate ``spread`` is unchanged either way.
+    """
     if not deck:
         raise ValueError("Deck is empty.")
+
+    def _weight(c: Card) -> float:
+        # If no alignment scoring happened, return 1.0 so rng.choices
+        # degenerates to uniform — equivalent to the old rng.choice path.
+        if c.alignment_score is None:
+            return 1.0
+        # Linear blend: at spread=0 weight = alignment_score (tight pull
+        # toward high-aligned cards); at spread=1 weight = 50 (constant,
+        # so sampling is uniform). Keeps the entropy knob authoritative.
+        return c.alignment_score * (1.0 - spread) + 50.0 * spread
+
+    def _pick(pool: list[Card]) -> Card:
+        weights = [_weight(c) for c in pool]
+        # Guard against degenerate all-zero (shouldn't happen — _weight
+        # floors at uniform 50) by falling back to plain choice.
+        if not any(w > 0 for w in weights):
+            return rng.choice(pool)
+        return rng.choices(pool, weights=weights, k=1)[0]
+
     # Group by domain
     by_domain: dict[str, list[Card]] = {}
     for c in deck:
@@ -732,7 +789,7 @@ def sample_cards(
     domains = list(by_domain.keys())
 
     start_domain = rng.choice(domains)
-    chosen: list[Card] = [rng.choice(by_domain[start_domain])]
+    chosen: list[Card] = [_pick(by_domain[start_domain])]
     used_ids = {id(chosen[0])}
 
     while len(chosen) < n:
@@ -746,11 +803,11 @@ def sample_cards(
             remaining = [c for c in deck if id(c) not in used_ids]
             if not remaining:
                 break
-            pick = rng.choice(remaining)
+            pick = _pick(remaining)
             chosen.append(pick)
             used_ids.add(id(pick))
             continue
-        pick = rng.choice(pool)
+        pick = _pick(pool)
         chosen.append(pick)
         used_ids.add(id(pick))
 
@@ -1700,6 +1757,89 @@ def total_score(score: dict) -> int:
         + score.get("uniqueness", 0)
         + score.get("topic_fit", 0)
     )
+
+
+# ---------------------------------------------------------------------------
+# Structural-alignment scorer (Gentner structure-mapping, brain-inspired).
+# One cheap batch call rates every card in the deck on whether its core
+# mechanism maps structurally onto the user's problem — separate from
+# topic-fit (which is "does the IDEA address the topic") and feasibility.
+# Used by sample_cards to weight within-domain selection when
+# AIDEA_STRUCTURE_BIAS is enabled.
+# ---------------------------------------------------------------------------
+
+
+ALIGNMENT_SYSTEM = (
+    "You score donor concepts by structural alignment to a user's stated "
+    "problem. Output STRICT JSON only — one object mapping card-name to "
+    "an integer 0-100, no commentary, no fences. The JSON keys stay verbatim "
+    "in whatever language the card names are written (do not translate them)."
+)
+
+
+ALIGNMENT_PROMPT_TEMPLATE = """\
+User problem / project / question:
+
+  {topic}
+
+Score each of the donor concepts below on STRUCTURAL ALIGNMENT to that
+problem, on a 0-100 scale.
+
+  - 100 = the donor's core relational schema (constraint shape, dynamic,
+    transformation pattern) directly transplants onto this problem — a
+    competent person seeing both would immediately see the analogy.
+  - 50  = it could plausibly transplant with creative work; the schemas
+    have partial overlap.
+  - 0   = there is no mappable structural correspondence; reusing this
+    donor would only work as decoration, not as load-bearing mechanism.
+
+This is NOT feasibility, NOT topic-fit, NOT novelty. Pure
+structure-mapping in Dedre Gentner's sense: do the relations between
+the donor's parts match the relations the user's problem needs?
+
+Use the full range. Most donors should land in 20-70; reserve 80+ for
+cases where the mechanism is genuinely a structural match, and 0-20
+for clear non-fits.
+
+Donor concepts:
+
+{card_list}
+
+Respond as ONE JSON object only, with one entry per card. Keys are the
+EXACT card names verbatim (no edits, no translation), values are
+integers 0-100. Example shape: {{"Card Name A": 72, "Card Name B": 35}}.
+"""
+
+
+async def score_alignment(
+    topic: str,
+    cards: list[Card],
+    model: str,
+) -> dict[str, int]:
+    """Return {card.name: 0-100 alignment} for every card in the deck.
+
+    Single batch LLM call — caller is expected to apply the scores by
+    setting ``card.alignment_score`` before sampling.
+    """
+    if not cards:
+        return {}
+    card_list = "\n".join(f"- {c.name} (from {c.domain})" for c in cards)
+    prompt = ALIGNMENT_PROMPT_TEMPLATE.format(
+        topic=topic.strip(),
+        card_list=card_list,
+    )
+    raw = await _query_text(prompt, ALIGNMENT_SYSTEM, model, kind="alignment")
+    obj = _try_parse_json_object(raw) or {}
+
+    out: dict[str, int] = {}
+    for c in cards:
+        v = obj.get(c.name)
+        try:
+            out[c.name] = max(0, min(100, int(float(v))))
+        except (TypeError, ValueError):
+            # Unscored cards default to mid-range so they aren't filtered out.
+            out[c.name] = 50
+    return out
 
 
 REFINE_PROMPT_TEMPLATE = """\
