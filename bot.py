@@ -532,9 +532,10 @@ HELP_TEXT = (
     "AIdea — applied-ideas synthesizer with entropy controls.\n\n"
     "Pipeline: topic → donor-deck (cards from many domains) → "
     "stochastic sample at entropy → synthesis → optional critic + refine.\n\n"
+    "Tip: just send a plain message — it's treated as /idea <your text>.\n\n"
     "Modes (pick one):\n"
     "/idea <topic>      default — n_ideas at the current entropy, feasibility "
-    "required\n"
+    "required (or just send the topic without any command)\n"
     "/einstein <topic>  four mechanism-specific ideas:\n"
     "     Adjacent Possible — step through a just-unlocked door\n"
     "     Exaptation — transplant a mechanism from another field\n"
@@ -956,9 +957,14 @@ async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🛑 Cancel signalled.")
 
 
-async def cmd_fallback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "I respond to slash commands. Try /help to see what's available.",
+async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Treat any non-command text message as a default /idea request."""
+    topic = (update.message.text or "").strip()
+    if not topic:
+        await update.message.reply_text(HELP_TEXT)
+        return
+    await run_pipeline_for_telegram(
+        update=update, context=ctx, topic=topic, mode="default",
     )
 
 
@@ -991,7 +997,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("feedback", cmd_feedback))
     app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_fallback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_message))
     return app
 
 
