@@ -779,7 +779,15 @@ INDEX_HTML = r"""<!doctype html>
   .mech-blurb { color: #666; font-size: 0.85rem; font-style: italic;
                 margin: 0.15rem 0 0.45rem; }
   .panel.usage { position: sticky; bottom: 0.6rem; margin-top: 1.2rem;
-                 background: #fbfbf7; }
+                 background: #fbfbf7; padding-top: 0.4rem; padding-bottom: 0.4rem; }
+  .panel.usage .meta { cursor: pointer; user-select: none;
+                       display: flex; align-items: center; gap: 0.4rem;
+                       margin: 0; }
+  .panel.usage .meta::before { content: '▸'; font-size: 0.7rem;
+                                color: #888; transition: transform 0.12s; }
+  .panel.usage[data-expanded="true"] .meta::before { transform: rotate(90deg); }
+  .panel.usage #usage-body { display: none; }
+  .panel.usage[data-expanded="true"] #usage-body { display: block; }
   .usage-refresh { cursor: pointer; color: #888; margin-left: 0.4rem;
                    font-size: 0.85rem; user-select: none; }
   .usage-refresh:hover { color: #1a1a1a; }
@@ -1539,7 +1547,18 @@ async function loadUsage() {
     if (r.ok) renderUsage(await r.json());
   } catch (_) { /* ignore */ }
 }
-document.getElementById('usage-refresh').addEventListener('click', loadUsage);
+document.getElementById('usage-refresh').addEventListener('click', (e) => {
+  e.stopPropagation();
+  loadUsage();
+});
+// Click the header to expand/collapse the usage panel. Stays collapsed
+// by default so a real estate-heavy 5-card grid never covers the idea
+// you're trying to read.
+document.querySelector('#usage-strip .meta').addEventListener('click', () => {
+  const strip = document.getElementById('usage-strip');
+  const expanded = strip.getAttribute('data-expanded') === 'true';
+  strip.setAttribute('data-expanded', expanded ? 'false' : 'true');
+});
 loadUsage();
 
 async function loadBootstrap() {
