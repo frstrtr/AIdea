@@ -15,6 +15,13 @@ Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
+# Drain in-flight requests on stop. SIGTERM goes only to the main Python
+# process so the claude subprocess keeps running and the awaited LLM call
+# returns normally; pending Telegram handlers finish, then the bot exits.
+# If something hangs past TimeoutStopSec, systemd escalates SIGKILL to the
+# whole cgroup as usual.
+KillMode=mixed
+TimeoutStopSec=180
 
 [Install]
 WantedBy=multi-user.target

@@ -2089,8 +2089,13 @@ def main(argv: list[str] | None = None) -> int:
 async def run_pipeline(args: argparse.Namespace) -> int:
     from usage import start_run
     from transcripts import set_source
-    run_id = start_run("cli")
-    set_source("cli")
+    # AIDEA_SOURCE lets operators tag a CLI replay with the source of the
+    # original request — e.g. when re-running a Telegram pipeline that was
+    # killed mid-flight, set it to "telegram-<chat_id>" so the ingested
+    # cards stay tenant-attributed correctly.
+    source = os.environ.get("AIDEA_SOURCE", "").strip() or "cli"
+    run_id = start_run(source)
+    set_source(source)
     if not args.quiet:
         print(f"[usage] run_id={run_id}", file=sys.stderr)
     spread, level = parse_entropy(args.entropy)
