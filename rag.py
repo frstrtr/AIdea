@@ -435,12 +435,20 @@ def retrieve_similar(
     if not any(docs):
         return []
 
-    bm25 = BM25Okapi(docs)
+    # epsilon=0.25 (default in rank_bm25) ensures terms get a small positive
+    # IDF floor in tiny corpora rather than collapsing to 0 / negative — so
+    # any actual token overlap surfaces as a non-zero score.
+    bm25 = BM25Okapi(docs, epsilon=0.25)
     scores = bm25.get_scores(query_tokens)
 
+    # Compute the per-doc overlap count alongside the BM25 score. Empty-
+    # overlap docs (overlap == 0) are rejected; everything else is kept
+    # and ranked by (BM25 × quality boost).
+    query_set = set(query_tokens)
     boosted: list[tuple[float, dict[str, Any]]] = []
-    for rec, s in zip(corpus, scores):
-        if s <= 0:
+    for rec, s, doc in zip(corpus, scores, docs):
+        overlap = len(query_set.intersection(doc))
+        if overlap == 0:
             continue
         # Combined critic + feedback signal in [-300, +300].
         total = outcomes.get(rec.get("run_id"))
