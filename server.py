@@ -13,9 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import time
+from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable
+
+from dotenv import load_dotenv
+
+# Load .env from the project directory before anything else reads env vars.
+load_dotenv(Path(__file__).parent / ".env")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse

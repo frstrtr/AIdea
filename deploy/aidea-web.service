@@ -1,0 +1,26 @@
+[Unit]
+Description=AIdea web app (FastAPI + SSE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aidea
+Group=aidea
+WorkingDirectory=/opt/aidea
+EnvironmentFile=/opt/aidea/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/aidea/.venv/bin/uvicorn server:app \
+    --host ${AIDEA_HOST} \
+    --port ${AIDEA_PORT} \
+    --proxy-headers \
+    --forwarded-allow-ips=*
+Restart=on-failure
+RestartSec=5
+# Local-only hardening — the long-running synthesis tasks need writes
+# to decks/ and usage.jsonl inside InstallDir, so we don't sandbox FS.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

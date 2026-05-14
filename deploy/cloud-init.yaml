@@ -1,0 +1,35 @@
+#cloud-config
+# Cloud-init user-data for a fresh AIdea VM on Proxmox VE (or any
+# cloud-init-capable platform). Boots a Debian/Ubuntu cloud image,
+# clones the repo, runs deploy/install.sh, and leaves the box waiting
+# for two manual one-time steps (the agent-CLI login and editing .env).
+
+hostname: aidea
+manage_etc_hosts: true
+
+# Adjust the SSH key below to one you own.
+users:
+  - default
+  - name: ops
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA...REPLACE_WITH_YOUR_PUBLIC_KEY...  ops@host
+
+package_update: true
+package_upgrade: true
+packages:
+  - git
+  - curl
+  - ca-certificates
+
+runcmd:
+  - su - ops -c "git clone https://github.com/frstrtr/AIdea.git /tmp/aidea-bootstrap"
+  - bash /tmp/aidea-bootstrap/deploy/install.sh
+  - rm -rf /tmp/aidea-bootstrap
+
+final_message: |
+  AIdea install finished in $UPTIME seconds.
+  Next: SSH in, run `sudo -iu aidea claude` to log the CLI into your
+  account, edit /opt/aidea/.env, then
+  `sudo systemctl enable --now aidea-web aidea-bot`.

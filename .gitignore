@@ -14,6 +14,7 @@ env/
 # user-specific topic text). Remove this line if you want decks tracked.
 decks/
 usage.jsonl
+.env
 
 # Editor / OS
 .vscode/

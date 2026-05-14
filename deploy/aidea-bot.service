@@ -1,0 +1,20 @@
+[Unit]
+Description=AIdea Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aidea
+Group=aidea
+WorkingDirectory=/opt/aidea
+EnvironmentFile=/opt/aidea/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/aidea/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

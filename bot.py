@@ -30,7 +30,13 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
+
+# Load .env from the project directory before anything else reads env vars.
+load_dotenv(Path(__file__).parent / ".env")
 
 from telegram import Update
 from telegram.constants import ParseMode

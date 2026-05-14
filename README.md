@@ -141,6 +141,14 @@ prompt size. Cards are generated once per `(topic, cards, depth, model)`
 combination and cached in `decks/` as JSON; subsequent runs hit the
 cache.
 
+## Deployment
+
+To run on a fresh Linux VM (Proxmox VE or any cloud-init-capable host),
+see [`deploy/README.md`](deploy/README.md). Two systemd units (web + bot),
+one `.env`, one shared `usage.jsonl`. Path A uses cloud-init for an
+unattended install; Path B is `bash install.sh` on any Linux VM you
+already have.
+
 ## Telegram bot
 
 ```bash
