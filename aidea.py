@@ -73,6 +73,30 @@ _RETRYABLE: tuple[type[BaseException], ...] = (
     OSError,
 )
 
+# The agent SDK raises a bare ``Exception(message)`` from several internal
+# failure paths (subprocess crash, malformed ResultMessage, "Claude Code
+# returned an error result: <subtype>", "Command failed with exit code N").
+# These slip past both the _RETRYABLE tuple AND the ClaudeSDKError except
+# branch in _run_query, so the user gets the raw SDK string on the very
+# first attempt with no retries. Pattern-match the message so we can route
+# them through the retry layer like any other transient failure.
+_SDK_TRANSIENT_MESSAGE_PATTERNS = (
+    "Claude Code returned an error result",
+    "Command failed with exit code",
+    "Unknown error",
+)
+
+
+def _is_transient_sdk_exception(exc: BaseException) -> bool:
+    """True iff a bare ``Exception`` from the SDK matches a known transient
+    failure mode — see _SDK_TRANSIENT_MESSAGE_PATTERNS. Conservative: only
+    plain Exception subclasses are matched, not arbitrary RuntimeError /
+    ValueError / etc., so genuine programmer mistakes still propagate."""
+    if type(exc) is not Exception:
+        return False
+    msg = str(exc)
+    return any(p in msg for p in _SDK_TRANSIENT_MESSAGE_PATTERNS)
+
 from transcripts import log_event as transcript_log
 from usage import (
     build_call_record,
@@ -1627,6 +1651,29 @@ async def _run_query(
             print(
                 f"[retry] {kind} attempt {attempt}/{max_attempts} failed "
                 f"({type(e).__name__}: {e}); sleeping {wait:.1f}s",
+                file=sys.stderr, flush=True,
+            )
+            await asyncio.sleep(wait)
+        except Exception as e:
+            # Bare Exception from the SDK — "Claude Code returned an error
+            # result: <subtype>" / "Command failed with exit code N". Only
+            # retry if the message matches a known transient pattern, so
+            # we don't accidentally retry genuine bugs.
+            if not _is_transient_sdk_exception(e):
+                raise
+            last_err = e
+            if attempt >= max_attempts:
+                break
+            wait = _backoff_seconds(attempt, last_rate_limit)
+            transcript_log(
+                "llm_error",
+                call_kind=kind, attempt=attempt, max_attempts=max_attempts,
+                error_type=type(e).__name__, error=str(e),
+                sleep_s=wait, retryable=True,
+            )
+            print(
+                f"[retry] {kind} attempt {attempt}/{max_attempts} failed "
+                f"(transient SDK: {e}); sleeping {wait:.1f}s",
                 file=sys.stderr, flush=True,
             )
             await asyncio.sleep(wait)

@@ -619,9 +619,29 @@ async def run_pipeline_for_telegram(
         transcript_log(
             "request_errored", error_type=type(e).__name__, error=str(e),
         )
-        await context.bot.send_message(
-            chat_id=chat_id, text=f"❌ pipeline failed: {e}",
-        )
+        # Localized, friendly message. The raw SDK string ("Claude Code
+        # returned an error result: success", "Command failed with exit
+        # code N") is meaningless to a user — show them something they
+        # can act on instead. Topic-language detection reuses the same
+        # helper as the greeting-filter welcome.
+        if _looks_russian(topic):
+            msg = (
+                "⚠️ Не получилось завершить генерацию идей.\n\n"
+                "Попробуйте, пожалуйста, ещё раз через минуту — иногда "
+                "это временная ошибка фонового сервиса. Если не помогает, "
+                "попробуйте переформулировать запрос (особенно если он про "
+                "медицинскую/чувствительную тему — модель может отказывать "
+                "в ответе)."
+            )
+        else:
+            msg = (
+                "⚠️ Couldn't finish generating ideas.\n\n"
+                "Please try again in a minute — sometimes the upstream "
+                "service has a transient error. If it keeps failing, try "
+                "rephrasing the request (especially if it's medical / "
+                "sensitive — the model can decline some topics)."
+            )
+        await context.bot.send_message(chat_id=chat_id, text=msg)
     finally:
         state.busy = False
         state.cancel.clear()
