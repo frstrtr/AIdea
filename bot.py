@@ -39,10 +39,11 @@ from dotenv import load_dotenv
 # Load .env from the project directory before anything else reads env vars.
 load_dotenv(Path(__file__).parent / ".env")
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -117,6 +118,11 @@ class ChatState:
     # know the bot isn't stuck.
     run_started_at: float = 0.0
     run_eta: float = 0.0  # the ETA we promised when the run started
+    # Topic awaiting yes/no confirmation from the user before we burn an
+    # idea-generation pipeline on it. Plain-text messages don't kick off
+    # work immediately — they sit here until the user clicks the inline
+    # "Yes, generate" button. Cleared on Yes (after launch) or No.
+    pending_topic: str | None = None
 
 
 # chat_id -> ChatState
@@ -1159,18 +1165,127 @@ _WELCOME_EN = (
 )
 
 
+_UNKNOWN_CMD_RU = (
+    "⚠️ Такая команда не распознана.\n\n"
+    "Доступные команды:\n"
+    "  /idea <запрос> — основная генерация идей\n"
+    "  /einstein /lsd /futures /dream /lucid — другие режимы\n"
+    "  /help — полная справка по командам и настройкам\n"
+    "  /settings /set — конфигурация\n"
+    "  /usage /corpus /feedback /cancel\n\n"
+    "Или просто напишите задачу/проблему/вопрос обычным сообщением — без слэша."
+)
+
+_UNKNOWN_CMD_EN = (
+    "⚠️ That command isn't recognised.\n\n"
+    "Available commands:\n"
+    "  /idea <topic> — main idea generation\n"
+    "  /einstein /lsd /futures /dream /lucid — alternate modes\n"
+    "  /help — full help with commands and settings\n"
+    "  /settings /set — configuration\n"
+    "  /usage /corpus /feedback /cancel\n\n"
+    "Or just send your task / problem / question as a plain message — no slash needed."
+)
+
+
+def _confirm_prompt(topic: str, ru: bool) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the localized 'are you sure?' confirmation message + buttons.
+    The topic is echoed back (clipped) so the user can sanity-check what
+    actually got received vs. what they thought they typed."""
+    preview = topic[:300] + ("…" if len(topic) > 300 else "")
+    if ru:
+        text = (
+            f"📥 Получено сообщение:\n\n«{preview}»\n\n"
+            "Отправить его в генерацию идей? Это займёт ~3 минуты и выдаст "
+            "3 разных идеи под вашу задачу."
+        )
+        yes, no = "✅ Да, генерировать", "❌ Нет, отменить"
+    else:
+        text = (
+            f"📥 Got your message:\n\n«{preview}»\n\n"
+            "Submit it as an idea-generation request? "
+            "Takes ~3 minutes and produces 3 different ideas."
+        )
+        yes, no = "✅ Yes, generate", "❌ No, cancel"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(yes, callback_data="idea:confirm"),
+        InlineKeyboardButton(no, callback_data="idea:cancel"),
+    ]])
+    return text, kb
+
+
 async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Treat any non-command text message as a default /idea request — unless
-    it's plainly a greeting or empty ping, in which case explain what the
-    bot does instead of burning a pipeline on it."""
+    """Handle non-command text messages. Three branches:
+    1. Starts with '/' — an unknown / typo'd command. Send help, don't
+       try to ideate on the command string itself.
+    2. Plain greeting / empty / too short — send the welcome explainer.
+    3. Substantive — stash as pending_topic and ask Yes/No before we
+       burn a ~3-min pipeline + tokens. The actual launch happens in
+       on_callback when the user clicks Yes."""
     topic = (update.message.text or "").strip()
+
+    if topic.startswith("/"):
+        msg = _UNKNOWN_CMD_RU if _looks_russian(topic) else _UNKNOWN_CMD_EN
+        await update.message.reply_text(msg)
+        return
+
     if _looks_like_idle_chat(topic):
         welcome = _WELCOME_RU if _looks_russian(topic) else _WELCOME_EN
         await update.message.reply_text(welcome)
         return
-    await run_pipeline_for_telegram(
-        update=update, context=ctx, topic=topic, mode="default",
-    )
+
+    state = state_for(update.effective_chat.id)
+    state.pending_topic = topic
+    text, kb = _confirm_prompt(topic, ru=_looks_russian(topic))
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Yes/No inline-button handler for the plain-text confirmation flow."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()  # stops the spinner on the button
+
+    chat_id = update.effective_chat.id
+    state = state_for(chat_id)
+    data = query.data or ""
+
+    if data == "idea:confirm":
+        topic = state.pending_topic
+        state.pending_topic = None
+        if not topic:
+            # Stale button click (bot restarted, or already confirmed).
+            try:
+                await query.edit_message_text("⚠️ Запрос уже не активен / no pending topic.")
+            except Exception:
+                pass
+            return
+        ru = _looks_russian(topic)
+        ack = (
+            f"✅ Запускаю генерацию для: «{topic[:200]}»"
+            if ru
+            else f"✅ Generating ideas for: «{topic[:200]}»"
+        )
+        try:
+            await query.edit_message_text(ack)
+        except Exception:
+            pass
+        await run_pipeline_for_telegram(
+            update=update, context=ctx, topic=topic, mode="default",
+        )
+    elif data == "idea:cancel":
+        state.pending_topic = None
+        ru = _looks_russian(query.message.text if query.message else "")
+        msg = (
+            "❌ Отменено — сообщение не отправлено в генерацию."
+            if ru
+            else "❌ Cancelled — your message was not submitted."
+        )
+        try:
+            await query.edit_message_text(msg)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1203,6 +1318,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_message))
+    # Yes/No buttons for the plain-text confirmation flow.
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^idea:(confirm|cancel)$"))
     return app
 
 
