@@ -1325,7 +1325,9 @@ async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     topic = (update.message.text or "").strip()
 
     # 1. Persistent bottom menu — tap routes to the matching action.
-    action = _MAIN_MENU_LABELS.get(topic)
+    #    Prefix match because labels carry trailing live-state suffixes
+    #    (e.g. "🎲 Mode: einstein").
+    action = _menu_action_for(topic)
     if action is not None:
         await _handle_menu_action(action, update, ctx)
         return
@@ -1546,41 +1548,60 @@ def _main_menu_text(s: "ChatSettings") -> str:
     )
 
 
-# Bottom-attached persistent ReplyKeyboard. Labels here are the exact text
-# the user's tap will send, so _MAIN_MENU_LABELS maps them to action keys
-# in on_plain_message. Note: Telegram does not support per-button colors
-# on either KeyboardButton or InlineKeyboardButton — emoji groupings are
-# the only visual differentiation available.
-_MAIN_MENU_LABELS: dict[str, str] = {
-    "🎲 Mode":     "open_mode",
-    "🌪 Entropy":  "open_entropy",
-    "📘 Depth":    "open_depth",
-    "🔧 Refine":   "toggle_refine",
-    "📈 Usage":    "show_usage",
-    "❓ Help":     "show_help",
-    "🧭 Status":   "show_status",
-    "✖ Hide menu": "hide_menu",
-}
+# Bottom-attached persistent ReplyKeyboard.
+#
+# Button text embeds the current value of each setting (e.g. "🎲 Mode:
+# einstein", "🔧 Refine: ON") so the user can read live state straight off
+# the keyboard without opening anything. Because the trailing value changes,
+# tap-routing in on_plain_message uses PREFIX matching — see
+# _MAIN_MENU_PREFIXES + _menu_action_for.
+#
+# Telegram does not support per-button colors on either KeyboardButton or
+# InlineKeyboardButton beyond Bot API 9.4's three predefined styles
+# (primary / success / danger) — emoji groupings carry the rest.
+_MAIN_MENU_PREFIXES: list[tuple[str, str]] = [
+    ("🎲 Mode",     "open_mode"),
+    ("🌪 Entropy",  "open_entropy"),
+    ("📘 Depth",    "open_depth"),
+    ("🔧 Refine",   "toggle_refine"),
+    ("📈 Usage",    "show_usage"),
+    ("❓ Help",     "show_help"),
+    ("🧭 Status",   "show_status"),
+    ("✖ Hide menu", "hide_menu"),
+]
 
 
-def _main_menu_kb(_s: "ChatSettings") -> ReplyKeyboardMarkup:
+def _menu_action_for(text: str) -> str | None:
+    """Map a tap on the bottom keyboard (whose label may carry a
+    trailing live-state suffix) back to a stable action key. Prefix
+    match so "🎲 Mode: einstein" still routes to open_mode."""
+    for prefix, action in _MAIN_MENU_PREFIXES:
+        if text.startswith(prefix):
+            return action
+    return None
+
+
+def _main_menu_kb(s: "ChatSettings") -> ReplyKeyboardMarkup:
     """Persistent bottom-attached menu. Two rows of three + one row of two.
+    Button text shows current values so the user reads live state at a
+    glance.
 
     Color scheme (Bot API 9.4):
-      primary (blue)  — opens a sub-picker
+      primary (blue)  — opens a sub-picker / tunable setting
       success (green) — neutral utility (status / usage / help)
       danger  (red)   — destructive (Hide menu)"""
+    refine_txt = "ON" if s.refine else "off"
     return ReplyKeyboardMarkup(
         [
             [
-                KeyboardButton("🎲 Mode",    style="primary"),
-                KeyboardButton("🌪 Entropy", style="primary"),
-                KeyboardButton("📘 Depth",   style="primary"),
+                KeyboardButton(f"🎲 Mode: {s.mode or 'default'}", style="primary"),
+                KeyboardButton(f"🌪 Entropy: {s.entropy}",        style="primary"),
+                KeyboardButton(f"📘 Depth: {s.card_depth}",       style="primary"),
             ],
             [
-                KeyboardButton("🔧 Refine",  style="primary"),
-                KeyboardButton("📈 Usage",   style="success"),
-                KeyboardButton("❓ Help",    style="success"),
+                KeyboardButton(f"🔧 Refine: {refine_txt}", style="primary"),
+                KeyboardButton("📈 Usage",                 style="success"),
+                KeyboardButton("❓ Help",                  style="success"),
             ],
             [
                 KeyboardButton("🧭 Status",     style="success"),
@@ -1682,6 +1703,7 @@ async def _handle_menu_action(
             chat_id=chat_id,
             text=f"🔧 Refine: *{'ON' if s.refine else 'off'}*",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_main_menu_kb(s),  # refresh button labels with new value
         )
 
     elif action == "show_usage":
@@ -1740,6 +1762,19 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     def _confirm_edit(label: str, value: str) -> str:
         return f"✅ *{label}* set to *{value}*"
 
+    async def _refresh_bottom_keyboard():
+        """Send a tiny status message whose only job is to push the
+        new ReplyKeyboardMarkup down — so the bottom row's live-state
+        labels reflect the change the user just made."""
+        try:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text="⚙️ updated",
+                reply_markup=_main_menu_kb(s),
+            )
+        except Exception:
+            pass
+
     if data.startswith("mode:"):
         key = data.split(":", 1)[1]
         valid = {k for k, _, _ in _MODE_INFO if k != "lucid"}
@@ -1752,6 +1787,7 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 await query.edit_message_text(body, parse_mode=ParseMode.MARKDOWN)
             except Exception:
                 pass
+            await _refresh_bottom_keyboard()
 
     elif data.startswith("entropy:"):
         key = data.split(":", 1)[1]
@@ -1765,6 +1801,7 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 )
             except Exception:
                 pass
+            await _refresh_bottom_keyboard()
 
     elif data.startswith("depth:"):
         key = data.split(":", 1)[1]
@@ -1778,6 +1815,7 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 )
             except Exception:
                 pass
+            await _refresh_bottom_keyboard()
 
 
 # ---------------------------------------------------------------------------
