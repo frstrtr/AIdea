@@ -48,6 +48,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -114,49 +115,56 @@ def _format_user_usage(chat_id: int) -> str:
     u = summarize_for_chat(chat_id)
     tot = u.get("total", {}) or {}
     week = u.get("last_7d", {}) or {}
-    calls = int(tot.get("calls", 0) or 0)
-    if calls == 0:
+    requests = int(tot.get("requests", 0) or 0)
+    if requests == 0:
         return (
             "📈 *Your usage*\n\n"
             "No completed runs yet from this chat. Send a topic and I'll "
-            "start tracking your tokens / cost."
+            "start tracking your requests / tokens / cost."
         )
     return (
         "📈 *Your usage*\n"
-        f"  last 7 days: {int(week.get('calls', 0) or 0)} calls · "
-        f"{fmt_tokens(week.get('output_tokens', 0))} out · "
+        f"  last 7 days: {int(week.get('requests', 0) or 0)} requests · "
+        f"{int(week.get('calls', 0) or 0)} LLM calls · "
         f"{fmt_usd(week.get('total_cost_usd', 0))}\n"
-        f"  all time:    {calls} calls · "
+        f"  all time:    {requests} requests · "
+        f"{int(tot.get('calls', 0) or 0)} LLM calls · "
         f"{fmt_tokens(tot.get('output_tokens', 0))} out · "
         f"{fmt_usd(tot.get('total_cost_usd', 0))}\n\n"
-        "_Only your own runs are counted. The bot is running on a "
-        "subscription shared across users._"
+        "_Only your own runs are counted. One request = one user message; "
+        "each generates 7–10 LLM calls (deck + ideas + scoring)._"
     )
 
 
 def _format_admin_usage() -> str:
-    """Admin view — globals plus top users by cost."""
+    """Admin view — globals plus top users by cost. Shows both 'requests'
+    (unique run_ids = user-visible asks) and 'calls' (LLM API invocations
+    = ~7-10 per request) so the admin sees both real demand and total
+    subscription burn."""
     u = summarize(run_id=None)
     tot = u.get("total", {}) or {}
     week = u.get("last_7d", {}) or {}
     per_chat = summarize_per_chat()
     lines = [
         "📈 *Usage — global (admin)*",
-        f"  last 7 days: {int(week.get('calls', 0) or 0)} calls · "
-        f"{fmt_tokens(week.get('output_tokens', 0))} out · "
+        f"  last 7 days: {int(week.get('requests', 0) or 0)} requests · "
+        f"{int(week.get('calls', 0) or 0)} LLM calls · "
         f"{fmt_usd(week.get('total_cost_usd', 0))}",
-        f"  all time:    {int(tot.get('calls', 0) or 0)} calls · "
+        f"  all time:    {int(tot.get('requests', 0) or 0)} requests · "
+        f"{int(tot.get('calls', 0) or 0)} LLM calls · "
         f"{fmt_tokens(tot.get('output_tokens', 0))} out · "
         f"{fmt_usd(tot.get('total_cost_usd', 0))}",
         "",
         "*Top chats by cost (all-time)*",
+        "  `      chat_id   reqs  calls    cost`",
     ]
-    for row in per_chat[:10]:
+    for row in per_chat[:15]:
         t = row["totals"]
+        reqs = int(t.get("requests", 0) or 0)
+        calls = int(t.get("calls", 0) or 0)
+        cost = fmt_usd(t.get("total_cost_usd", 0))
         lines.append(
-            f"  · `{row['chat_id']:>14}` — "
-            f"{int(t.get('calls', 0) or 0)} calls · "
-            f"{fmt_usd(t.get('total_cost_usd', 0))}"
+            f"  `{row['chat_id']:>14}  {reqs:>4}  {calls:>5}  {cost:>7}`"
         )
     if not per_chat:
         lines.append("  (no records yet)")
@@ -357,6 +365,36 @@ def estimate_runtime_seconds(mode: str, refine: bool = False) -> float:
         return base * (1.6 if refine else 1.0)
     recent = durations[-10:]
     return sum(recent) / len(recent)
+
+
+async def _send_with_retry(
+    bot: Any,
+    *,
+    chat_id: int,
+    text: str,
+    attempts: int = 2,
+    **kwargs: Any,
+) -> None:
+    """bot.send_message wrapped with a single retry on TimedOut / NetworkError.
+
+    Telegram occasionally returns 'Timed out' on a perfectly good request when
+    the bot is sending bursts (e.g. settings-update confirmation + keyboard
+    refresh + idea content all back-to-back). The default read_timeout is 5s
+    and a single sub-second blip from api.telegram.org surfaces as a cryptic
+    'usage error: Timed out' to the user. One retry with a short backoff
+    masks the blip without bloating the call site."""
+    last_err: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return
+        except (TimedOut, NetworkError) as e:
+            last_err = e
+            if attempt + 1 >= attempts:
+                break
+            await asyncio.sleep(0.8)
+    if last_err is not None:
+        raise last_err
 
 
 def fmt_eta(seconds: float) -> str:
@@ -1713,11 +1751,20 @@ async def _handle_menu_action(
                 if _is_admin(chat_id)
                 else _format_user_usage(chat_id)
             )
-            await ctx.bot.send_message(
-                chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
+            await _send_with_retry(
+                ctx.bot,
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
-            await ctx.bot.send_message(chat_id=chat_id, text=f"usage error: {e}")
+            try:
+                await _send_with_retry(
+                    ctx.bot, chat_id=chat_id, text=f"usage error: {e}",
+                )
+            except Exception:
+                # Even the error-reply send failed; just log and move on.
+                log.exception("show_usage: failed to deliver error message")
 
     elif action == "show_help":
         await ctx.bot.send_message(chat_id=chat_id, text=HELP_TEXT)

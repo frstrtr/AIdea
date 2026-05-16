@@ -154,8 +154,14 @@ def build_call_record(
 
 
 def _totals(items: list[dict]) -> dict:
+    # 'calls' is the number of LLM API invocations (themes + deck + per-idea
+    # synth + per-idea critic + optional refine — typically 7-10 per request).
+    # 'requests' is the number of DISTINCT user requests (unique run_ids) —
+    # what a user actually thinks of as "how many ideas did I generate".
+    request_ids = {r.get("run_id") for r in items if r.get("run_id")}
     return {
         "calls": len(items),
+        "requests": len(request_ids),
         "input_tokens": sum(r.get("input_tokens", 0) for r in items),
         "output_tokens": sum(r.get("output_tokens", 0) for r in items),
         "cache_creation_input_tokens": sum(
