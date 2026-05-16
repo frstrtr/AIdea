@@ -232,6 +232,10 @@ class ChatState:
     # work immediately — they sit here until the user clicks the inline
     # "Yes, generate" button. Cleared on Yes (after launch) or No.
     pending_topic: str | None = None
+    # Set when the user taps the 🍵 Brew button on the bottom keyboard:
+    # the next plain-text message is routed straight into the Brew flow
+    # (no Yes/No confirmation, Pillow card rendered at the end).
+    awaiting_brew_topic: bool = False
 
 
 # chat_id -> ChatState
@@ -740,6 +744,49 @@ async def run_pipeline_for_telegram(
                 transcript_log("refined", i=winner["i"], text=refined)
                 await send_idea(update, context, "Refined winner", refined)
 
+        # Brew rendering hook — when extra.brew_render is set (cmd_brew /
+        # 🍵 Brew button path), pick the best idea (refined winner if
+        # available, else max-scored, else first), parse it into title /
+        # pitch / mechanism / first_step, render a 1080×1920 Pillow card,
+        # and deliver as a shareable photo. The text version of the idea
+        # has already been sent earlier in the loop, so this is purely an
+        # additive visual artifact for Stories sharing.
+        if extra and extra.get("brew_render") and ideas:
+            try:
+                from brew_render import (
+                    render_card,
+                    parse_idea_fields,
+                    default_output_path,
+                )
+                # Pick the best text: refined > critic-winner > first.
+                refined_text = locals().get("refined")
+                if refined_text:
+                    best_text = refined_text
+                elif scored:
+                    best_text = ideas[winner["i"]]
+                else:
+                    best_text = ideas[0]
+                fields = parse_idea_fields(best_text)
+                png_path = render_card(
+                    title=fields.get("title") or topic[:60],
+                    pitch=fields.get("pitch", ""),
+                    mechanism=fields.get("mechanism", ""),
+                    first_step=fields.get("first_step", ""),
+                    output_path=default_output_path(brew_id=run_id),
+                )
+                with png_path.open("rb") as f:
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=f,
+                        caption="☕ Your brew is ready — tap & hold the image to share to Stories.",
+                    )
+            except Exception as e:
+                log.exception("brew render failed")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"(brew render failed — text version above still works: {e})",
+                )
+
         # Final usage summary
         u = summarize(run_id=run_id)
         run = u.get("this_run", {})
@@ -876,6 +923,28 @@ async def cmd_idea(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await run_pipeline_for_telegram(
         update=update, context=ctx, topic=topic, mode="default",
+    )
+
+
+async def cmd_brew(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Brew = pipeline + Pillow card. Same pipeline as /idea but the
+    winning idea is also rendered as a 1080×1920 PNG and sent as a
+    shareable photo (Stories-ready). Caller uses the chat's current
+    mode setting — Default unless menu-picked otherwise."""
+    topic = _topic_from(update)
+    chat_id = update.effective_chat.id
+    if not topic:
+        await update.message.reply_text(
+            "Send: `/brew <your topic>` — or tap 🍵 *Brew* on the menu "
+            "and send your topic as the next message.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    state = state_for(chat_id)
+    mode = state.settings.mode or "default"
+    await run_pipeline_for_telegram(
+        update=update, context=ctx, topic=topic, mode=mode,
+        extra={"brew_render": True},
     )
 
 
@@ -1424,9 +1493,13 @@ async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     # 1. Persistent bottom menu — tap routes to the matching action.
     #    Prefix match because labels carry trailing live-state suffixes
-    #    (e.g. "🎲 Mode: einstein").
+    #    (e.g. "🎲 Mode: einstein"). Tapping any menu button also CLEARS
+    #    a pending Brew prompt — the user changed their mind.
     action = _menu_action_for(topic)
     if action is not None:
+        state = state_for(update.effective_chat.id)
+        if action != "start_brew":
+            state.awaiting_brew_topic = False
         await _handle_menu_action(action, update, ctx)
         return
 
@@ -1435,12 +1508,31 @@ async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(msg)
         return
 
+    state = state_for(update.effective_chat.id)
+
+    # If 🍵 Brew was just tapped, this message IS the brew topic — go
+    # straight into the pipeline with brew_render=True, skipping the
+    # Yes/No confirmation (the button tap already counts as opt-in).
+    if state.awaiting_brew_topic:
+        state.awaiting_brew_topic = False
+        if _looks_like_idle_chat(topic):
+            await update.message.reply_text(
+                "🍵 Brew cancelled — that didn't look like a topic. "
+                "Tap 🍵 Brew again when you have a real question."
+            )
+            return
+        mode = state.settings.mode or "default"
+        await run_pipeline_for_telegram(
+            update=update, context=ctx, topic=topic, mode=mode,
+            extra={"brew_render": True},
+        )
+        return
+
     if _looks_like_idle_chat(topic):
         welcome = _WELCOME_RU if _looks_russian(topic) else _WELCOME_EN
         await update.message.reply_text(welcome)
         return
 
-    state = state_for(update.effective_chat.id)
     state.pending_topic = topic
     text, kb = _confirm_prompt(
         topic, ru=_looks_russian(topic), s=state.settings,
@@ -1734,6 +1826,7 @@ def _main_menu_text(s: "ChatSettings") -> str:
 # InlineKeyboardButton beyond Bot API 9.4's three predefined styles
 # (primary / success / danger) — emoji groupings carry the rest.
 _MAIN_MENU_PREFIXES: list[tuple[str, str]] = [
+    ("🍵 Brew",     "start_brew"),
     ("🎲 Mode",     "open_mode"),
     ("🌪 Entropy",  "open_entropy"),
     ("📘 Depth",    "open_depth"),
@@ -1767,6 +1860,8 @@ def _main_menu_kb(s: "ChatSettings") -> ReplyKeyboardMarkup:
     refine_txt = "ON" if s.refine else "off"
     return ReplyKeyboardMarkup(
         [
+            # Top row — the primary action gets its own wide button.
+            [KeyboardButton("🍵 Brew", style="success")],
             [
                 KeyboardButton(f"🎲 Mode: {s.mode or 'default'}", style="primary"),
                 KeyboardButton(f"🌪 Entropy: {s.entropy}",        style="primary"),
@@ -1915,6 +2010,25 @@ async def _handle_menu_action(
             reply_markup=ReplyKeyboardRemove(),
         )
 
+    elif action == "start_brew":
+        # Two-step Brew flow: this button only PROMPTS for a topic.
+        # The next plain-text message routes straight into the Brew
+        # pipeline via on_plain_message's awaiting_brew_topic check —
+        # no Yes/No confirmation step, since tapping 🍵 already counts
+        # as the explicit opt-in.
+        state.awaiting_brew_topic = True
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🍵 *Brew*\n\n"
+                "Send your topic / problem / question as your next message. "
+                "I'll run the full pipeline and deliver one *card* — "
+                "1080×1920, ready to share to Stories.\n\n"
+                "_Tip: any other menu button cancels the Brew prompt._"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
 
 async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Inline-keyboard handler for the sub-pickers opened from the bottom
@@ -2013,6 +2127,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("idea", cmd_idea))
+    app.add_handler(CommandHandler("brew", cmd_brew))
     app.add_handler(CommandHandler("einstein", cmd_einstein))
     app.add_handler(CommandHandler("lsd", cmd_lsd))
     app.add_handler(CommandHandler("futures", cmd_futures))
