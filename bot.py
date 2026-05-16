@@ -712,11 +712,24 @@ HELP_TEXT = (
 
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT)
+    """First-touch entry point. Send the full help text AND attach the
+    persistent bottom button menu in one message so new users see every
+    option immediately without typing /menu."""
+    state = state_for(update.effective_chat.id)
+    await update.message.reply_text(
+        HELP_TEXT,
+        reply_markup=_main_menu_kb(state.settings),
+    )
 
 
 async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT)
+    """Same as /start — help text plus the bottom button menu, so the
+    user always has the keyboard attached after asking for help."""
+    state = state_for(update.effective_chat.id)
+    await update.message.reply_text(
+        HELP_TEXT,
+        reply_markup=_main_menu_kb(state.settings),
+    )
 
 
 def _topic_from(update: Update) -> str:
@@ -1334,6 +1347,89 @@ _MODE_INFO: list[tuple[str, str, str]] = [
     ("lucid",    "🧘 Lucid",    "feasibility ON — directional dream toward a prior"),
 ]
 
+
+# Rich per-mode descriptions shown in the picker-confirm message, so a user
+# who taps a mode also learns *what it does and why*, not just "set to X".
+# Distilled from MODES_TEXT (which is the long /help block); each entry is
+# kept under ~700 chars so it fits in a single Telegram message comfortably.
+_MODE_DESCRIPTION: dict[str, str] = {
+    "default": (
+        "💡 *Default mode* — applied conceptual blending.\n\n"
+        "Picks 1+ donor concepts and finds the structural mechanism that "
+        "transfers onto your topic. Feasibility required at every entropy "
+        "level — even 'mad' must ship a v0.1 in six months.\n\n"
+        "Best for: concrete problems where you want one transplantable "
+        "mechanism with a first step you can take this week.\n\n"
+        "_Sources: Fauconnier & Turner, The Way We Think (2002); "
+        "Kauffman, Investigations (2000) — the 'adjacent possible' framing._"
+    ),
+    "einstein": (
+        "🧠 *Einstein mode* — four passes, one per generative mechanism "
+        "from Steven Johnson's _Where Good Ideas Come From_ (2010):\n\n"
+        "  • *Adjacent Possible* — name a capability unlocked in the "
+        "last 1–3 years, walk through that door.\n"
+        "  • *Exaptation* — transplant a mechanism from a far-distant "
+        "field (Gould & Vrba, 1982).\n"
+        "  • *Slow Hunch* — articulate a latent tension the field hasn't "
+        "named.\n"
+        "  • *Productive Error* — invert a load-bearing assumption "
+        "(Fleming 1928).\n\n"
+        "Best for: ambitious topics where you want four structurally "
+        "different angles instead of variants of one idea. Pair with "
+        "Refine=ON to rank them and harden the winner."
+    ),
+    "lsd": (
+        "🌀 *LSD mode* — two-pass structure (the most expensive mode):\n\n"
+        "  *Pass 1 — Anarchic generation:* priors relaxed, error-detection "
+        "OFF. Flatten the hierarchy, treat 2–3 load-bearing assumptions "
+        "as noise, force cross-module connections between distant donors.\n\n"
+        "  *Pass 2 — Sober validation:* priors back online. Separates "
+        "the structural insight from the hallucination, proposes a "
+        "buildable v0.1.\n\n"
+        "Best for: when the field's assumptions feel like the blocker — "
+        "you want to dissolve them, then verify what survives.\n\n"
+        "_Source: Carhart-Harris & Friston, 'REBUS and the Anarchic Brain' "
+        "(Pharmacol Reviews 2019)._"
+    ),
+    "futures": (
+        "🔮 *Futures mode* — four temporal horizons (+1y / +3y / +10y / "
+        "+30y).\n\n"
+        "At each horizon: name three concrete shifts that are likely by "
+        "then, identify what's obvious from there but invisible today, "
+        "translate to a v0.1 you can ship *this year*.\n\n"
+        "Best for: strategy questions, product roadmaps, picking the "
+        "right bet given where the field is heading.\n\n"
+        "_Lineage: Pierre Wack scenario planning (Shell, 1970s); "
+        "Stewart Brand, The Clock of the Long Now (1999); Anil Seth on "
+        "perceptual forward-modeling (Being You, 2021)._"
+    ),
+    "dream": (
+        "💤 *Dream mode* — prediction-error signal OFFLINE. Generative "
+        "model runs free, NO feasibility floor.\n\n"
+        "Output: a vivid dream image (may violate physics, economics, "
+        "regulation) plus a 'what survives waking' line naming the "
+        "salvageable fragment.\n\n"
+        "Best for: harvesting raw material, not shipping. Use the dream "
+        "as a metaphor source for a Default or Einstein run afterwards.\n\n"
+        "_Source: Friston, Free Energy Principle (2010) — dreams as "
+        "complexity reduction / synaptic garbage collection. Hobson & "
+        "Friston (Progress in Neurobiology, 2012)._"
+    ),
+    "lucid": (
+        "🧘 *Lucid mode* — dream-state generation + a directional prior "
+        "you inject.\n\n"
+        "The hallucination biases toward your belief; one reality-check "
+        "fires before waking. More salvageable than pure dream because "
+        "the prior anchors what the engine imagines.\n\n"
+        "Lucid is NOT available from the menu picker because it needs a "
+        "prior — use the slash command directly:\n"
+        "  `/lucid <prior> | <topic>`\n"
+        "  Example: `/lucid solo-founder only | how do I monetize my AI tool`\n\n"
+        "_Source: LaBerge, Exploring the World of Lucid Dreaming (1990); "
+        "Voss et al., Sleep (2009)._"
+    ),
+}
+
 _ENTROPY_INFO: list[tuple[str, str, str]] = [
     ("sane",   "😴 Sane",   "stay within established practice — 'we should just do that'"),
     ("wild",   "✨ Wild",    "combine familiar in uncommon ways — 'huh, didn't think of that combo'"),
@@ -1588,11 +1684,10 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         if key in valid:
             s.mode = key
             lab = _mode_label(key)
+            desc = _MODE_DESCRIPTION.get(key, "")
+            body = f"✅ *Mode set to {lab}*\n\n{desc}" if desc else _confirm_edit("Mode", lab)
             try:
-                await query.edit_message_text(
-                    _confirm_edit("Mode", lab),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                await query.edit_message_text(body, parse_mode=ParseMode.MARKDOWN)
             except Exception:
                 pass
 
