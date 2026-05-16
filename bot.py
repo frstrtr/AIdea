@@ -664,7 +664,9 @@ HELP_TEXT = (
     "AIdea — applied-ideas synthesizer with entropy controls.\n\n"
     "Pipeline: topic → donor-deck (cards from many domains) → "
     "stochastic sample at entropy → synthesis → optional critic + refine.\n\n"
-    "Tip: just send a plain message — it's treated as /idea <your text>.\n\n"
+    "🧭 /menu — open the button-driven control panel (modes, entropy, depth, refine).\n"
+    "Tip: just send a plain message — bot will echo it back and ask Yes/No "
+    "before running the pipeline.\n\n"
     "Modes (pick one):\n"
     "/idea <topic>      default — n_ideas at the current entropy, feasibility "
     "required (or just send the topic without any command)\n"
@@ -1137,14 +1139,16 @@ _WELCOME_RU = (
     "Привет 👋\n\n"
     "Я генерирую *неожиданные, но выполнимые* идеи под вашу конкретную задачу.\n\n"
     "Просто напишите мне свою задачу, проблему или вопрос одной-двумя "
-    "фразами — и я через 2–3 минуты пришлю 3 разных идеи с конкретным "
-    "первым шагом и примером, где похожий механизм уже сработал.\n\n"
+    "фразами — я попрошу подтверждения (Да/Нет) и через 2–3 минуты "
+    "пришлю 3 разных идеи с конкретным первым шагом и примером, где "
+    "похожий механизм уже сработал.\n\n"
     "Примеры:\n"
     "  • Как развивать персональный сайт эксперта по управлению бизнесом?\n"
     "  • Что приготовить на ужин за 15 минут?\n"
     "  • Придумай новую технологию кроссовок\n\n"
     "Команды:\n"
-    "  /help — все режимы и настройки\n"
+    "  🧭 /menu — панель управления с кнопками (режим, энтропия, глубина)\n"
+    "  /help — все команды и настройки\n"
     "  /einstein /lsd /futures /dream /lucid — другие режимы генерации"
 )
 
@@ -1152,15 +1156,16 @@ _WELCOME_EN = (
     "Hi 👋\n\n"
     "I generate *unexpected-but-doable* ideas for your specific problem.\n\n"
     "Just send your task, problem, or question in a sentence or two — "
-    "in 2–3 minutes I'll reply with 3 different ideas, each with a "
-    "concrete first step and a real example where a similar mechanism "
-    "has worked elsewhere.\n\n"
+    "I'll ask you to confirm (Yes/No) and in 2–3 minutes I'll reply with "
+    "3 different ideas, each with a concrete first step and a real "
+    "example where a similar mechanism has worked elsewhere.\n\n"
     "Examples:\n"
     "  • How to develop a personal site for a business consultant?\n"
     "  • What can I cook for dinner in 15 minutes?\n"
     "  • Invent a new sneaker technology\n\n"
     "Commands:\n"
-    "  /help — all modes and settings\n"
+    "  🧭 /menu — button-driven control panel (mode, entropy, depth)\n"
+    "  /help — all commands and settings\n"
     "  /einstein /lsd /futures /dream /lucid — other generation modes"
 )
 
@@ -1289,6 +1294,283 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Button-driven control panel — /menu opens a single message with inline
+# keyboards for picking mode, entropy, depth, and toggles. Discoverable
+# alternative to the textual /set syntax. Plain-text + /idea keep working
+# unchanged for users who already know what they want.
+# ---------------------------------------------------------------------------
+
+
+_MODE_INFO: list[tuple[str, str, str]] = [
+    # (key, label, one-line description shown in the picker)
+    ("default",  "💡 Default",  "applied ideas · feasibility required"),
+    ("einstein", "🧠 Einstein", "4 mechanism passes (adjacent / exapt / hunch / err)"),
+    ("lsd",      "🌀 LSD",      "prior dissolution + sober validation"),
+    ("futures",  "🔮 Futures",  "4 temporal horizons (+1y / +3y / +10y / +30y)"),
+    ("dream",    "💤 Dream",    "feasibility OFF — dream image + interpretation"),
+    ("lucid",    "🧘 Lucid",    "feasibility ON — directional dream toward a prior"),
+]
+
+_ENTROPY_INFO: list[tuple[str, str, str]] = [
+    ("sane",   "😴 Sane",   "stay within established practice — 'we should just do that'"),
+    ("wild",   "✨ Wild",    "combine familiar in uncommon ways — 'huh, didn't think of that combo'"),
+    ("insane", "🤯 Insane", "transplant mechanism from unrelated domain — 'wait, can we?'"),
+    ("crazy",  "🚨 Crazy",  "challenge a load-bearing assumption — sounds reckless, survives reread"),
+    ("mad",    "🎭 Mad",    "reinterpret the problem itself — must still ship v0.1 in 6 months"),
+]
+
+_DEPTH_INFO: list[tuple[str, str, str]] = [
+    ("shallow", "🪶 Shallow", "name + domain only — fastest, most stochastic"),
+    ("medium",  "📘 Medium",  "+ mechanism, transfer hint — default"),
+    ("deep",    "📗 Deep",    "+ invariants, prior application — slower, richer"),
+    ("max",     "📚 Max",     "every field populated — slowest, most context"),
+]
+
+
+def _mode_label(key: str) -> str:
+    for k, lab, _ in _MODE_INFO:
+        if k == key:
+            return lab
+    return key
+
+
+def _settings_summary(s: "ChatSettings") -> str:
+    mode_lab = _mode_label("default")  # main menu always assumes default unless user picks
+    return (
+        f"Mode: default · "
+        f"Entropy: {s.entropy} · "
+        f"Depth: {s.card_depth} · "
+        f"Ideas: {s.n_ideas} · "
+        f"Refine: {'on' if s.refine else 'off'}"
+    )
+
+
+def _main_menu_text(s: "ChatSettings") -> str:
+    return (
+        "🧭 *AIdea control panel*\n\n"
+        "Current settings:\n"
+        f"  · Entropy: *{s.entropy}*\n"
+        f"  · Card depth: *{s.card_depth}*\n"
+        f"  · Ideas per run: *{s.n_ideas}*\n"
+        f"  · Refine winner: *{'on' if s.refine else 'off'}*\n\n"
+        "Pick a section to adjust, or just send your topic as a plain "
+        "message and I'll ask you to confirm before generating."
+    )
+
+
+def _main_menu_kb(s: "ChatSettings") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎲 Mode", callback_data="menu:mode"),
+            InlineKeyboardButton(f"🌪 Entropy: {s.entropy}", callback_data="menu:entropy"),
+        ],
+        [
+            InlineKeyboardButton(f"📘 Depth: {s.card_depth}", callback_data="menu:depth"),
+            InlineKeyboardButton(
+                f"🔧 Refine: {'ON' if s.refine else 'off'}",
+                callback_data="menu:toggle_refine",
+            ),
+        ],
+        [
+            InlineKeyboardButton("📝 New idea", callback_data="menu:newidea"),
+            InlineKeyboardButton("📈 Usage", callback_data="menu:usage"),
+        ],
+        [
+            InlineKeyboardButton("❓ Help / commands", callback_data="menu:help"),
+        ],
+    ])
+
+
+def _picker_kb(items: list[tuple[str, str, str]], prefix: str, current: str) -> InlineKeyboardMarkup:
+    """Build a sub-picker keyboard. One row per option, marker on the
+    currently-selected value, and a Back button at the bottom."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, label, desc in items:
+        marker = "✅ " if key == current else "   "
+        rows.append([InlineKeyboardButton(
+            f"{marker}{label} — {desc}",
+            callback_data=f"{prefix}:{key}",
+        )])
+    rows.append([InlineKeyboardButton("← Back to menu", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_menu(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open the button-driven control panel."""
+    state = state_for(update.effective_chat.id)
+    await update.message.reply_text(
+        _main_menu_text(state.settings),
+        reply_markup=_main_menu_kb(state.settings),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-keyboard handler for the /menu flow.
+
+    Pattern routes:
+      menu:main           → main menu
+      menu:mode           → mode picker
+      menu:entropy        → entropy picker
+      menu:depth          → depth picker
+      menu:toggle_refine  → flip refine, redraw main
+      menu:newidea        → ack + prompt to send a topic
+      menu:usage          → send usage stats inline
+      menu:help           → send help text
+      mode:<name>         → set mode (one-shot for next plain-text; or stored)
+      entropy:<name>      → set entropy, redraw main
+      depth:<name>        → set depth, redraw main
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    chat_id = update.effective_chat.id
+    state = state_for(chat_id)
+    s = state.settings
+    data = (query.data or "")
+
+    async def _redraw_main():
+        try:
+            await query.edit_message_text(
+                _main_menu_text(s),
+                reply_markup=_main_menu_kb(s),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    if data == "menu:main":
+        await _redraw_main()
+
+    elif data == "menu:mode":
+        # 'default' is the only mode that actually flows through plain-text
+        # auto-confirm; the other modes require their own slash command
+        # because they consume different args. So the picker here is
+        # informational + links to the right slash command rather than a
+        # one-click apply.
+        rows = [
+            [InlineKeyboardButton(f"{lab} — {desc}", callback_data=f"info:mode:{key}")]
+            for key, lab, desc in _MODE_INFO
+        ]
+        rows.append([InlineKeyboardButton("← Back to menu", callback_data="menu:main")])
+        try:
+            await query.edit_message_text(
+                "*Modes*\n\n"
+                "Plain-text messages always run *default* mode. To use the "
+                "other modes, send the matching slash command with your topic:\n\n"
+                "`/einstein <topic>`  `/lsd <topic>`  `/futures <topic>`\n"
+                "`/dream <topic>`  `/lucid <prior> | <topic>`\n\n"
+                "Tap a mode below to see what it does:",
+                reply_markup=InlineKeyboardMarkup(rows),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    elif data == "menu:entropy":
+        try:
+            await query.edit_message_text(
+                "*Entropy* — how far the cross-domain sampler is allowed to wander.\n\n"
+                "Lower = familiar, executable; higher = more surprising but riskier.\n"
+                f"Current: *{s.entropy}*",
+                reply_markup=_picker_kb(_ENTROPY_INFO, "entropy", s.entropy),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    elif data == "menu:depth":
+        try:
+            await query.edit_message_text(
+                "*Card depth* — how many fields each donor card carries.\n\n"
+                "Shallow is fast and stochastic; max is rich but slow.\n"
+                f"Current: *{s.card_depth}*",
+                reply_markup=_picker_kb(_DEPTH_INFO, "depth", s.card_depth),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    elif data == "menu:toggle_refine":
+        s.refine = not s.refine
+        await _redraw_main()
+
+    elif data == "menu:newidea":
+        try:
+            await query.edit_message_text(
+                "📝 *New idea*\n\n"
+                "Just send me your topic / problem / question as a plain "
+                "message. I'll echo it back and ask you to confirm before "
+                "running the pipeline (~3 min).",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    elif data == "menu:help":
+        # Send help as a fresh message (HELP_TEXT is long, edit-in-place would
+        # blow past Telegram's 4096-char button-message limit).
+        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT) if False else None
+        await ctx.bot.send_message(chat_id=chat_id, text=HELP_TEXT)
+
+    elif data == "menu:usage":
+        await ctx.bot.send_message(chat_id=chat_id, text="Pulling current usage...")
+        # Reuse cmd_usage's logic by calling it with a synthesized message-less update.
+        try:
+            from usage import summarize
+            u = summarize()
+            run = u.get("total", {}) or {}
+            txt = (
+                f"📈 *Usage (all time)*\n"
+                f"  calls: {fmt_num(run.get('calls', 0))}\n"
+                f"  tokens out: {fmt_tokens(run.get('output_tokens', 0))}\n"
+                f"  cost: {fmt_usd(run.get('total_cost_usd', 0))}"
+            )
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=txt, parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            await ctx.bot.send_message(chat_id=chat_id, text=f"usage error: {e}")
+
+    elif data.startswith("info:mode:"):
+        # Single-mode info card with a Back button.
+        key = data.split(":", 2)[2]
+        info = next((item for item in _MODE_INFO if item[0] == key), None)
+        if info is None:
+            return
+        _, lab, desc = info
+        slash = "/idea" if key == "default" else f"/{key}"
+        try:
+            await query.edit_message_text(
+                f"*{lab}*\n\n"
+                f"{desc}\n\n"
+                f"Use: `{slash} <your topic>`",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("← Back to modes", callback_data="menu:mode"),
+                ]]),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    elif data.startswith("entropy:"):
+        key = data.split(":", 1)[1]
+        valid = {k for k, _, _ in _ENTROPY_INFO}
+        if key in valid:
+            s.entropy = key
+        await _redraw_main()
+
+    elif data.startswith("depth:"):
+        key = data.split(":", 1)[1]
+        valid = {k for k, _, _ in _DEPTH_INFO}
+        if key in valid:
+            s.card_depth = key
+        await _redraw_main()
+
+
+# ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
 
@@ -1317,9 +1599,15 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("feedback", cmd_feedback))
     app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_message))
     # Yes/No buttons for the plain-text confirmation flow.
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^idea:(confirm|cancel)$"))
+    # Button-driven control panel — opens via /menu.
+    app.add_handler(CallbackQueryHandler(
+        on_menu_callback,
+        pattern=r"^(menu:|info:|mode:|entropy:|depth:)",
+    ))
     return app
 
 
