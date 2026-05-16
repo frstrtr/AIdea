@@ -172,6 +172,85 @@ def _totals(items: list[dict]) -> dict:
     }
 
 
+def _extract_chat_id(run_id: str) -> str | None:
+    """Pull the Telegram chat_id out of a run_id of shape 'tg-<chat_id>-<hash>'.
+    Also handles 'telegram-<chat_id>-<hash>' (manual replays). Returns None
+    for web / cli / other prefixes."""
+    if not run_id:
+        return None
+    parts = run_id.split("-")
+    if len(parts) >= 2 and parts[0] in ("tg", "telegram"):
+        return parts[1]
+    return None
+
+
+def summarize_for_chat(chat_id: int | str) -> dict:
+    """Per-user usage summary — filters records to a single Telegram chat_id.
+    Same shape as summarize() but only counts that user's runs. Used for the
+    regular-user /usage view so they don't see other people's spend."""
+    target = str(chat_id)
+    records = [r for r in _load_records()
+               if _extract_chat_id(r.get("run_id", "")) == target]
+    return _summarize_from(records)
+
+
+def summarize_per_chat() -> list[dict]:
+    """Group all records by chat_id, return sorted-by-cost list of
+    {chat_id, totals}. Used for the admin breakdown."""
+    by_chat: dict[str, list[dict]] = {}
+    for r in _load_records():
+        cid = _extract_chat_id(r.get("run_id", ""))
+        if cid is None:
+            cid = "(non-telegram)"
+        by_chat.setdefault(cid, []).append(r)
+    out = [
+        {"chat_id": cid, "totals": _totals(items)}
+        for cid, items in by_chat.items()
+    ]
+    out.sort(key=lambda d: -d["totals"].get("total_cost_usd", 0))
+    return out
+
+
+def _summarize_from(records: list[dict]) -> dict:
+    """Shared totals helper used by summarize() and summarize_for_chat()."""
+    now = time.time()
+    day = 86_400
+    five_h = 5 * 3600
+    last_7d = [r for r in records if r.get("ts", 0) > now - 7 * day]
+    last_30d = [r for r in records if r.get("ts", 0) > now - 30 * day]
+    # 5-h-windows-touched heuristic over last_7d
+    windows = {int(r.get("ts", 0) // five_h) for r in last_7d}
+    # most recent rate-limit observation
+    rl_recs = [r for r in records
+               if r.get("rate_limit_status") and r.get("rate_limit_resets_at")]
+    rl_recs.sort(key=lambda r: r.get("rate_limit_resets_at", 0), reverse=True)
+    rate_limit = None
+    if rl_recs:
+        top = rl_recs[0]
+        rate_limit = {
+            "status": top.get("rate_limit_status"),
+            "type": top.get("rate_limit_type"),
+            "resets_at": top.get("rate_limit_resets_at"),
+            "utilization": top.get("rate_limit_utilization"),
+            "observed_at": top.get("ts"),
+        }
+    return {
+        "this_run": _totals([]),  # callers can fill via run_id when needed
+        "last_7d": _totals(last_7d),
+        "last_30d": _totals(last_30d),
+        "total": _totals(records),
+        "five_h_windows_last_7d": len(windows),
+        "rate_limit": rate_limit,
+        "note": (
+            "Tokens / duration / cost come from the agent SDK's ResultMessage. "
+            "five_h_windows_last_7d is a local heuristic — the real "
+            "subscription ceiling is not exposed through the SDK. rate_limit "
+            "reflects the most recently observed RateLimitEvent and is "
+            "authoritative until the window resets."
+        ),
+    }
+
+
 def summarize(run_id: str | None = None) -> dict:
     """Return totals over this-run / last-7d / last-30d / all-time, plus the
     most-recently observed rate-limit window. The 5h-windows-this-week count

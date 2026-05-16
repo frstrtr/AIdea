@@ -81,7 +81,96 @@ from aidea import (
     total_score,
 )
 from transcripts import log_event as transcript_log, set_source
-from usage import start_run, summarize
+from usage import (
+    start_run,
+    summarize,
+    summarize_for_chat,
+    summarize_per_chat,
+)
+
+
+def _admin_chat_ids() -> set[int]:
+    """Comma-separated AIDEA_ADMIN_CHAT_IDS env var → set of chat_ids.
+    Empty / unset means no admins (everyone gets the user view)."""
+    raw = os.environ.get("AIDEA_ADMIN_CHAT_IDS", "")
+    out: set[int] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(int(tok))
+        except ValueError:
+            continue
+    return out
+
+
+def _is_admin(chat_id: int) -> bool:
+    return chat_id in _admin_chat_ids()
+
+
+def _format_user_usage(chat_id: int) -> str:
+    """Compact per-user view — what the user sees in /usage."""
+    u = summarize_for_chat(chat_id)
+    tot = u.get("total", {}) or {}
+    week = u.get("last_7d", {}) or {}
+    calls = int(tot.get("calls", 0) or 0)
+    if calls == 0:
+        return (
+            "📈 *Your usage*\n\n"
+            "No completed runs yet from this chat. Send a topic and I'll "
+            "start tracking your tokens / cost."
+        )
+    return (
+        "📈 *Your usage*\n"
+        f"  last 7 days: {int(week.get('calls', 0) or 0)} calls · "
+        f"{fmt_tokens(week.get('output_tokens', 0))} out · "
+        f"{fmt_usd(week.get('total_cost_usd', 0))}\n"
+        f"  all time:    {calls} calls · "
+        f"{fmt_tokens(tot.get('output_tokens', 0))} out · "
+        f"{fmt_usd(tot.get('total_cost_usd', 0))}\n\n"
+        "_Only your own runs are counted. The bot is running on a "
+        "subscription shared across users._"
+    )
+
+
+def _format_admin_usage() -> str:
+    """Admin view — globals plus top users by cost."""
+    u = summarize(run_id=None)
+    tot = u.get("total", {}) or {}
+    week = u.get("last_7d", {}) or {}
+    per_chat = summarize_per_chat()
+    lines = [
+        "📈 *Usage — global (admin)*",
+        f"  last 7 days: {int(week.get('calls', 0) or 0)} calls · "
+        f"{fmt_tokens(week.get('output_tokens', 0))} out · "
+        f"{fmt_usd(week.get('total_cost_usd', 0))}",
+        f"  all time:    {int(tot.get('calls', 0) or 0)} calls · "
+        f"{fmt_tokens(tot.get('output_tokens', 0))} out · "
+        f"{fmt_usd(tot.get('total_cost_usd', 0))}",
+        "",
+        "*Top chats by cost (all-time)*",
+    ]
+    for row in per_chat[:10]:
+        t = row["totals"]
+        lines.append(
+            f"  · `{row['chat_id']:>14}` — "
+            f"{int(t.get('calls', 0) or 0)} calls · "
+            f"{fmt_usd(t.get('total_cost_usd', 0))}"
+        )
+    if not per_chat:
+        lines.append("  (no records yet)")
+    rl = u.get("rate_limit")
+    if rl and rl.get("resets_at"):
+        dt = rl["resets_at"] - time.time()
+        if dt > 0:
+            h, m = int(dt // 3600), int((dt % 3600) // 60)
+            lines.append("")
+            lines.append(
+                f"Subscription window: status={rl.get('status', '?')}, "
+                f"resets in {h}h {m}m"
+            )
+    return "\n".join(lines)
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
@@ -975,48 +1064,14 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_usage(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    u = summarize(run_id=None)
-    lines = []
-    for label, key in (
-        ("This week", "last_7d"),
-        ("This month", "last_30d"),
-        ("All time", "total"),
-    ):
-        b = u.get(key, {})
-        lines.append(
-            f"{label}: {b.get('calls', 0)} calls · "
-            f"{fmt_tokens(b.get('input_tokens', 0))} in / "
-            f"{fmt_tokens(b.get('output_tokens', 0))} out · "
-            f"{fmt_ms(b.get('duration_ms', 0))} · "
-            f"{fmt_usd(b.get('total_cost_usd', 0))}"
-        )
-    lines.append(
-        f"5h windows touched (last 7d): {u.get('five_h_windows_last_7d', 0)} "
-        "(local heuristic; not subscription truth)"
-    )
-    rl = u.get("rate_limit")
-    if rl:
-        status = rl.get("status", "?")
-        util = rl.get("utilization")
-        util_s = f"{round(util * 100)}%" if isinstance(util, (int, float)) else "—"
-        resets = ""
-        if rl.get("resets_at"):
-            dt = rl["resets_at"] - time.time()
-            if dt > 0:
-                h, m = int(dt // 3600), int((dt % 3600) // 60)
-                resets = (
-                    f", resets in {h}h {m}m"
-                    if h else f", resets in {m}m"
-                )
-        lines.append(
-            f"Subscription window ({rl.get('type', '?')}): "
-            f"status={status}, utilization={util_s}{resets}"
-        )
+    """Per-user view by default. Admin (AIDEA_ADMIN_CHAT_IDS env var)
+    gets globals + top-chat breakdown instead."""
+    chat_id = update.effective_chat.id
+    if _is_admin(chat_id):
+        text = _format_admin_usage()
     else:
-        lines.append("Subscription window: no rate-limit event observed yet")
-    lines.append("")
-    lines.append(u.get("note", ""))
-    await update.message.reply_text("\n".join(lines))
+        text = _format_user_usage(chat_id)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_feedback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1619,18 +1674,13 @@ async def _handle_menu_action(
 
     elif action == "show_usage":
         try:
-            from usage import summarize
-            u = summarize()
-            tot = u.get("total", {}) or {}
-            calls = int(tot.get("calls", 0) or 0)
-            txt = (
-                f"📈 *Usage (all time)*\n"
-                f"  calls: {calls}\n"
-                f"  tokens out: {fmt_tokens(tot.get('output_tokens', 0))}\n"
-                f"  cost: {fmt_usd(tot.get('total_cost_usd', 0))}"
+            text = (
+                _format_admin_usage()
+                if _is_admin(chat_id)
+                else _format_user_usage(chat_id)
             )
             await ctx.bot.send_message(
-                chat_id=chat_id, text=txt, parse_mode=ParseMode.MARKDOWN,
+                chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:
             await ctx.bot.send_message(chat_id=chat_id, text=f"usage error: {e}")
