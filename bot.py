@@ -1323,26 +1323,71 @@ _UNKNOWN_CMD_EN = (
 )
 
 
-def _confirm_prompt(topic: str, ru: bool) -> tuple[str, InlineKeyboardMarkup]:
+def _effective_n_ideas(s: "ChatSettings") -> tuple[int, str]:
+    """Return (n_ideas, why) — modes that force a specific count get a
+    short suffix explaining why. Einstein/Futures are 4-pass by design;
+    LSD/Dream/Lucid honour the user's n_ideas; Default uses n_ideas as-is."""
+    mode = s.mode or "default"
+    if mode == "einstein":
+        return 4, "one per Johnson mechanism (Adjacent / Exapt / Hunch / Err)"
+    if mode == "futures":
+        return 4, "one per horizon (+1y / +3y / +10y / +30y)"
+    return int(s.n_ideas or 1), ""
+
+
+def _confirm_prompt(
+    topic: str,
+    ru: bool,
+    s: "ChatSettings",
+) -> tuple[str, InlineKeyboardMarkup]:
     """Build the localized 'are you sure?' confirmation message + buttons.
+
     The topic is echoed back (clipped) so the user can sanity-check what
-    actually got received vs. what they thought they typed.
+    got received, and the active settings are surfaced as a parameter
+    block so they're not committing to a 3-minute pipeline blindly.
 
     Yes is styled `success` (green), No is styled `danger` (red) — Bot API
     9.4 button colors, supported by python-telegram-bot ≥ 22.7."""
     preview = topic[:300] + ("…" if len(topic) > 300 else "")
+    mode = s.mode or "default"
+    n_ideas, n_reason = _effective_n_ideas(s)
+    eta = estimate_runtime_seconds(mode, refine=bool(s.refine))
+    refine_on = bool(s.refine)
+
     if ru:
+        params = (
+            f"⚙️ Параметры:\n"
+            f"  • Режим:    *{_mode_label(mode)}*\n"
+            f"  • Энтропия: *{s.entropy}*\n"
+            f"  • Карты:    колода *{s.cards}* × глубина *{s.card_depth}* · "
+            f"*{s.n_concepts}* на идею\n"
+            f"  • Идей:     *{n_ideas}*"
+            + (f"  _({n_reason})_" if n_reason else "")
+            + "\n"
+            f"  • Доработка победителя: *{'вкл' if refine_on else 'выкл'}*\n"
+            f"  • Ожидаемое время: *~{fmt_eta(eta)}*"
+        )
         text = (
             f"📥 Получено сообщение:\n\n«{preview}»\n\n"
-            "Отправить его в генерацию идей? Это займёт ~3 минуты и выдаст "
-            "3 разных идеи под вашу задачу."
+            f"{params}\n\nОтправить в генерацию идей?"
         )
         yes, no = "✅ Да, генерировать", "❌ Нет, отменить"
     else:
+        params = (
+            f"⚙️ Settings:\n"
+            f"  • Mode:    *{_mode_label(mode)}*\n"
+            f"  • Entropy: *{s.entropy}*\n"
+            f"  • Cards:   deck *{s.cards}* × depth *{s.card_depth}* · "
+            f"*{s.n_concepts}* drawn per idea\n"
+            f"  • Ideas:   *{n_ideas}*"
+            + (f"  _({n_reason})_" if n_reason else "")
+            + "\n"
+            f"  • Refine winner: *{'on' if refine_on else 'off'}*\n"
+            f"  • ETA: *~{fmt_eta(eta)}*"
+        )
         text = (
             f"📥 Got your message:\n\n«{preview}»\n\n"
-            "Submit it as an idea-generation request? "
-            "Takes ~3 minutes and produces 3 different ideas."
+            f"{params}\n\nSubmit as an idea-generation request?"
         )
         yes, no = "✅ Yes, generate", "❌ No, cancel"
     kb = InlineKeyboardMarkup([[
@@ -1382,8 +1427,12 @@ async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     state = state_for(update.effective_chat.id)
     state.pending_topic = topic
-    text, kb = _confirm_prompt(topic, ru=_looks_russian(topic))
-    await update.message.reply_text(text, reply_markup=kb)
+    text, kb = _confirm_prompt(
+        topic, ru=_looks_russian(topic), s=state.settings,
+    )
+    await update.message.reply_text(
+        text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
