@@ -1074,6 +1074,18 @@ async def cmd_usage(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+async def cmd_whoami(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tell the user their Telegram chat_id. Useful for finding the value
+    to put into AIDEA_ADMIN_CHAT_IDS on the LXC."""
+    chat_id = update.effective_chat.id
+    is_admin = _is_admin(chat_id)
+    await update.message.reply_text(
+        f"Your chat_id: `{chat_id}`\n"
+        f"Admin: *{'yes' if is_admin else 'no'}*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 async def cmd_feedback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Explicit user-feedback signal targeting the last completed run.
 
@@ -1793,6 +1805,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("usage", cmd_usage))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("corpus", cmd_corpus))
     app.add_handler(CommandHandler("feedback", cmd_feedback))
     app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
