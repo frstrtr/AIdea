@@ -1208,7 +1208,10 @@ _UNKNOWN_CMD_EN = (
 def _confirm_prompt(topic: str, ru: bool) -> tuple[str, InlineKeyboardMarkup]:
     """Build the localized 'are you sure?' confirmation message + buttons.
     The topic is echoed back (clipped) so the user can sanity-check what
-    actually got received vs. what they thought they typed."""
+    actually got received vs. what they thought they typed.
+
+    Yes is styled `success` (green), No is styled `danger` (red) — Bot API
+    9.4 button colors, supported by python-telegram-bot ≥ 22.7."""
     preview = topic[:300] + ("…" if len(topic) > 300 else "")
     if ru:
         text = (
@@ -1225,8 +1228,8 @@ def _confirm_prompt(topic: str, ru: bool) -> tuple[str, InlineKeyboardMarkup]:
         )
         yes, no = "✅ Yes, generate", "❌ No, cancel"
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(yes, callback_data="idea:confirm"),
-        InlineKeyboardButton(no, callback_data="idea:cancel"),
+        InlineKeyboardButton(yes, callback_data="idea:confirm", style="success"),
+        InlineKeyboardButton(no, callback_data="idea:cancel", style="danger"),
     ]])
     return text, kb
 
@@ -1398,12 +1401,28 @@ _MAIN_MENU_LABELS: dict[str, str] = {
 
 
 def _main_menu_kb(_s: "ChatSettings") -> ReplyKeyboardMarkup:
-    """Persistent bottom-attached menu. Two rows of three + one row of two."""
+    """Persistent bottom-attached menu. Two rows of three + one row of two.
+
+    Color scheme (Bot API 9.4):
+      primary (blue)  — opens a sub-picker
+      success (green) — neutral utility (status / usage / help)
+      danger  (red)   — destructive (Hide menu)"""
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🎲 Mode"),     KeyboardButton("🌪 Entropy"),  KeyboardButton("📘 Depth")],
-            [KeyboardButton("🔧 Refine"),   KeyboardButton("📈 Usage"),    KeyboardButton("❓ Help")],
-            [KeyboardButton("🧭 Status"),   KeyboardButton("✖ Hide menu")],
+            [
+                KeyboardButton("🎲 Mode",    style="primary"),
+                KeyboardButton("🌪 Entropy", style="primary"),
+                KeyboardButton("📘 Depth",   style="primary"),
+            ],
+            [
+                KeyboardButton("🔧 Refine",  style="primary"),
+                KeyboardButton("📈 Usage",   style="success"),
+                KeyboardButton("❓ Help",    style="success"),
+            ],
+            [
+                KeyboardButton("🧭 Status",     style="success"),
+                KeyboardButton("✖ Hide menu",  style="danger"),
+            ],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -1414,13 +1433,18 @@ def _main_menu_kb(_s: "ChatSettings") -> ReplyKeyboardMarkup:
 def _picker_kb(items: list[tuple[str, str, str]], prefix: str, current: str) -> InlineKeyboardMarkup:
     """Build a sub-picker keyboard. One row per option, marker on the
     currently-selected value. No Back button — the persistent bottom
-    keyboard is always visible, so navigation is handled there."""
+    keyboard is always visible, so navigation is handled there.
+
+    Color: currently-selected option is styled `success` (green) so the
+    user can spot their current pick at a glance."""
     rows: list[list[InlineKeyboardButton]] = []
     for key, label, desc in items:
-        marker = "✅ " if key == current else "   "
+        is_current = (key == current)
+        marker = "✅ " if is_current else "   "
         rows.append([InlineKeyboardButton(
             f"{marker}{label} — {desc}",
             callback_data=f"{prefix}:{key}",
+            style="success" if is_current else None,
         )])
     return InlineKeyboardMarkup(rows)
 
