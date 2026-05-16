@@ -1335,6 +1335,19 @@ def _effective_n_ideas(s: "ChatSettings") -> tuple[int, str]:
     return int(s.n_ideas or 1), ""
 
 
+def _depth_detail(depth_name: str) -> str:
+    """Return '(N fields/card, ~T tok)' for the named depth. Pulled live
+    from aidea.CARD_DEPTH_BY_NAME so it stays in sync with the source."""
+    try:
+        from aidea import CARD_DEPTH_BY_NAME
+        d = CARD_DEPTH_BY_NAME.get(depth_name)
+        if d is None:
+            return ""
+        return f"({len(d.fields)} fields/card, ~{d.target_tokens} tok)"
+    except Exception:
+        return ""
+
+
 def _confirm_prompt(
     topic: str,
     ru: bool,
@@ -1354,13 +1367,15 @@ def _confirm_prompt(
     eta = estimate_runtime_seconds(mode, refine=bool(s.refine))
     refine_on = bool(s.refine)
 
+    depth_extra = _depth_detail(s.card_depth)
+
     if ru:
         params = (
             f"⚙️ Параметры:\n"
             f"  • Режим:    *{_mode_label(mode)}*\n"
             f"  • Энтропия: *{s.entropy}*\n"
-            f"  • Карты:    колода *{s.cards}* × глубина *{s.card_depth}* · "
-            f"*{s.n_concepts}* на идею\n"
+            f"  • Карты:    колода *{s.cards}* × глубина *{s.card_depth}* "
+            f"{depth_extra} · *{s.n_concepts}* на идею\n"
             f"  • Идей:     *{n_ideas}*"
             + (f"  _({n_reason})_" if n_reason else "")
             + "\n"
@@ -1377,8 +1392,8 @@ def _confirm_prompt(
             f"⚙️ Settings:\n"
             f"  • Mode:    *{_mode_label(mode)}*\n"
             f"  • Entropy: *{s.entropy}*\n"
-            f"  • Cards:   deck *{s.cards}* × depth *{s.card_depth}* · "
-            f"*{s.n_concepts}* drawn per idea\n"
+            f"  • Cards:   deck *{s.cards}* × depth *{s.card_depth}* "
+            f"{depth_extra} · *{s.n_concepts}* drawn per idea\n"
             f"  • Ideas:   *{n_ideas}*"
             + (f"  _({n_reason})_" if n_reason else "")
             + "\n"
@@ -1458,6 +1473,41 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
         ru = _looks_russian(topic)
         mode = state.settings.mode or "default"
+
+        # Lucid needs a 'prior | topic' (or 'prior :: topic') format because
+        # the prior anchors the hallucination. Parse here so the user can
+        # pick Lucid from the menu and then just type 'prior | topic' as
+        # their next message — no slash command needed.
+        extra: dict | None = None
+        if mode == "lucid":
+            sep = None
+            if "|" in topic:
+                sep = "|"
+            elif "::" in topic:
+                sep = "::"
+            if sep:
+                prior, _, lucid_topic = topic.partition(sep)
+                topic = lucid_topic.strip()
+                extra = {"lucid_prior": prior.strip()}
+            else:
+                # No prior supplied — explain the format and abort gracefully.
+                msg = (
+                    "⚠️ Lucid-режим требует формат `prior | topic`.\n\n"
+                    "Например:\n"
+                    "  `solo-founder only | как монетизировать AI-бота`\n\n"
+                    "Либо выберите другой режим через 🎲 *Mode*."
+                    if ru else
+                    "⚠️ Lucid mode needs a `prior | topic` format.\n\n"
+                    "Example:\n"
+                    "  `solo-founder only | how do I monetize my AI tool`\n\n"
+                    "Or pick a different mode via 🎲 *Mode*."
+                )
+                try:
+                    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+                except Exception:
+                    pass
+                return
+
         mode_lab = _mode_label(mode)
         ack = (
             f"✅ Запускаю генерацию ({mode_lab}) для: «{topic[:200]}»"
@@ -1469,7 +1519,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
         await run_pipeline_for_telegram(
-            update=update, context=ctx, topic=topic, mode=mode,
+            update=update, context=ctx, topic=topic, mode=mode, extra=extra,
         )
     elif data == "idea:cancel":
         state.pending_topic = None
@@ -1750,15 +1800,11 @@ async def _handle_menu_action(
             chat_id=chat_id,
             text=(
                 "*Mode* — how the synthesizer assembles each idea.\n\n"
-                f"Current: *{_mode_label(s.mode or 'default')}*\n"
-                "Lucid mode (needs a 'prior' string) stays on its own "
-                "slash command: `/lucid <prior> | <topic>`."
+                f"Current: *{_mode_label(s.mode or 'default')}*\n\n"
+                "_Note: Lucid needs a 'prior | topic' format — see the "
+                "description after picking it._"
             ),
-            reply_markup=_picker_kb(
-                [(k, lab, desc) for k, lab, desc in _MODE_INFO if k != "lucid"],
-                "mode",
-                s.mode or "default",
-            ),
+            reply_markup=_picker_kb(_MODE_INFO, "mode", s.mode or "default"),
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -1873,7 +1919,7 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     if data.startswith("mode:"):
         key = data.split(":", 1)[1]
-        valid = {k for k, _, _ in _MODE_INFO if k != "lucid"}
+        valid = {k for k, _, _ in _MODE_INFO}
         if key in valid:
             s.mode = key
             lab = _mode_label(key)
