@@ -88,6 +88,7 @@ class GenerateRequest(BaseModel):
     themes: list[str] | None = None  # explicit theme override for deck-gen
     theme_entropy: float | None = None  # 0..1; defaults to spread of entropy field
     evolve_deck: bool = False  # rewrite winning cards back into the deck cache
+    brew: bool = False  # render the winning idea as a 1080×1920 Pillow card
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +582,40 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
                 yield _sse("evolved", {"pairs": pairs})
                 transcript_log("evolved", pairs=pairs)
 
+    # Brew card render — same hook as the Telegram /brew flow, just emitted
+    # as an SSE event with the PNG inline (base64) so the page can show it
+    # and offer a download / share link. Picks the best text available:
+    # refined > critic-winner > first idea.
+    if req.brew and ideas:
+        try:
+            import base64
+            from brew_render import (
+                render_card, parse_idea_fields, default_output_path,
+            )
+            refined_text = locals().get("refined")
+            if refined_text:
+                best_text = refined_text
+            elif scored:
+                best_text = ideas[winner["i"]]
+            else:
+                best_text = ideas[0]
+            fields = parse_idea_fields(best_text)
+            png_path = render_card(
+                title=fields.get("title") or req.topic[:60],
+                pitch=fields.get("pitch", ""),
+                mechanism=fields.get("mechanism", ""),
+                first_step=fields.get("first_step", ""),
+                output_path=default_output_path(brew_id=run_id),
+            )
+            png_b64 = base64.b64encode(png_path.read_bytes()).decode("ascii")
+            yield _sse("brew_card", {
+                "filename": png_path.name,
+                "png_base64": png_b64,
+                "size": png_path.stat().st_size,
+            })
+        except Exception as e:
+            yield _sse("error", {"message": f"brew render failed: {e}"})
+
     try:
         yield _sse("usage", usage_summarize(run_id=run_id))
     except Exception:
@@ -1047,6 +1082,11 @@ INDEX_HTML = r"""<!doctype html>
   </label>
 
   <label class="inline">
+    <input type="checkbox" name="brew">
+    🍵 Brew — also render the winning idea as a 1080×1920 PNG card, ready to share to Instagram / TikTok Stories.
+  </label>
+
+  <label class="inline">
     <input type="checkbox" name="refine">
     Critic + refine winner (extra calls: 1 score per idea, 1 refinement)
   </label>
@@ -1156,7 +1196,7 @@ form.addEventListener('submit', async (e) => {
       const t = Number(v);
       if (!isNaN(t)) payload.theme_entropy = t;
     }
-    else if (['regen_deck','refine','einstein','lsd','futures','dream','evolve_deck'].includes(k)) payload[k] = true;
+    else if (['regen_deck','refine','einstein','lsd','futures','dream','evolve_deck','brew'].includes(k)) payload[k] = true;
     else if (k === 'themes') {
       // comma- or newline-separated; empty => omit
       const parts = String(v).split(/[,\n]+/).map(s => s.trim()).filter(Boolean);
@@ -1320,6 +1360,27 @@ function handleEvent(chunk) {
     addPanel(
       '<div class="meta refined-meta">Refined · idea ' + (obj.i + 1) + '</div>' +
       '<div class="idea refined"><pre>' + escapeHtml(obj.text) + '</pre></div>'
+    );
+  } else if (event === 'brew_card') {
+    // 🍵 Brew — inline preview of the rendered 1080x1920 PNG with a
+    // download link. Page renders a small thumbnail; user clicks the
+    // link to save / share. Base64 is decoded once into a Blob URL
+    // so the same data isn't kept in memory twice.
+    const bytes = Uint8Array.from(atob(obj.png_base64), function (c) { return c.charCodeAt(0); });
+    const blob = new Blob([bytes], { type: 'image/png' });
+    const url = URL.createObjectURL(blob);
+    const sizeKb = Math.round((obj.size || bytes.length) / 1024);
+    addPanel(
+      '<div class="meta">🍵 Brew card · ' + escapeHtml(obj.filename) + ' · ' + sizeKb + ' KB</div>' +
+      '<div class="brew-card-wrap" style="text-align:center;">' +
+        '<img src="' + url + '" alt="Brew card" ' +
+             'style="max-width:320px;height:auto;border:1px solid #eee;border-radius:6px;margin:0.6rem 0;" />' +
+        '<div>' +
+          '<a href="' + url + '" download="' + escapeHtml(obj.filename) + '" ' +
+             'style="display:inline-block;padding:0.4rem 0.9rem;border:1px solid #1a1a1a;border-radius:6px;text-decoration:none;color:#1a1a1a;font-size:0.9rem;">' +
+             '⬇ Download PNG (Stories-ready)</a>' +
+        '</div>' +
+      '</div>'
     );
   } else if (event === 'evolved') {
     finishStatus('evolve', 'deck evolved: ' + obj.pairs.length + ' card(s) updated');
