@@ -233,9 +233,12 @@ class ChatState:
     # "Yes, generate" button. Cleared on Yes (after launch) or No.
     pending_topic: str | None = None
     # Set when the user taps the 🍵 Brew button on the bottom keyboard:
-    # the next plain-text message is routed straight into the Brew flow
-    # (no Yes/No confirmation, Pillow card rendered at the end).
+    # the next plain-text message becomes the pending_topic, the user
+    # gets the same Yes/No confirmation card as the regular flow, and
+    # pending_brew tells the confirm callback to render a Pillow card
+    # at the end of the pipeline. Cleared on submit or cancel.
     awaiting_brew_topic: bool = False
+    pending_brew: bool = False
 
 
 # chat_id -> ChatState
@@ -1421,12 +1424,17 @@ def _confirm_prompt(
     topic: str,
     ru: bool,
     s: "ChatSettings",
+    brew: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build the localized 'are you sure?' confirmation message + buttons.
 
     The topic is echoed back (clipped) so the user can sanity-check what
     got received, and the active settings are surfaced as a parameter
     block so they're not committing to a 3-minute pipeline blindly.
+
+    When ``brew`` is True the header is tagged with 🍵 so the user sees
+    they're about to fire a Brew (text + Pillow card) rather than the
+    regular text-only flow.
 
     Yes is styled `success` (green), No is styled `danger` (red) — Bot API
     9.4 button colors, supported by python-telegram-bot ≥ 22.7."""
@@ -1435,6 +1443,16 @@ def _confirm_prompt(
     n_ideas, n_reason = _effective_n_ideas(s)
     eta = estimate_runtime_seconds(mode, refine=bool(s.refine))
     refine_on = bool(s.refine)
+    header_ru = "🍵 Получено для Brew:" if brew else "📥 Получено сообщение:"
+    header_en = "🍵 Got your topic for Brew:" if brew else "📥 Got your message:"
+    confirm_tail_ru = (
+        " Запустить Brew (текст + карточка для Stories)?"
+        if brew else " Отправить в генерацию идей?"
+    )
+    confirm_tail_en = (
+        " Run the Brew (text idea + shareable Stories card)?"
+        if brew else " Submit as an idea-generation request?"
+    )
 
     depth_extra = _depth_detail(s.card_depth)
 
@@ -1452,8 +1470,8 @@ def _confirm_prompt(
             f"  • Ожидаемое время: *~{fmt_eta(eta)}*"
         )
         text = (
-            f"📥 Получено сообщение:\n\n«{preview}»\n\n"
-            f"{params}\n\nОтправить в генерацию идей?"
+            f"{header_ru}\n\n«{preview}»\n\n"
+            f"{params}\n\n{confirm_tail_ru}"
         )
         yes, no = "✅ Да, генерировать", "❌ Нет, отменить"
     else:
@@ -1470,8 +1488,8 @@ def _confirm_prompt(
             f"  • ETA: *~{fmt_eta(eta)}*"
         )
         text = (
-            f"📥 Got your message:\n\n«{preview}»\n\n"
-            f"{params}\n\nSubmit as an idea-generation request?"
+            f"{header_en}\n\n«{preview}»\n\n"
+            f"{params}\n\n{confirm_tail_en}"
         )
         yes, no = "✅ Yes, generate", "❌ No, cancel"
     kb = InlineKeyboardMarkup([[
@@ -1510,32 +1528,29 @@ async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     state = state_for(update.effective_chat.id)
 
-    # If 🍵 Brew was just tapped, this message IS the brew topic — go
-    # straight into the pipeline with brew_render=True, skipping the
-    # Yes/No confirmation (the button tap already counts as opt-in).
-    if state.awaiting_brew_topic:
-        state.awaiting_brew_topic = False
-        if _looks_like_idle_chat(topic):
+    # If 🍵 Brew was just tapped, this message IS the brew topic. Run
+    # it through the SAME Yes/No confirmation card as the regular flow,
+    # but flag pending_brew so the confirm callback adds the Pillow
+    # card render. Tapping the button alone is not enough opt-in —
+    # users still want to sanity-check the topic before paying ~3 min.
+    is_brew = state.awaiting_brew_topic
+    state.awaiting_brew_topic = False
+
+    if _looks_like_idle_chat(topic):
+        if is_brew:
             await update.message.reply_text(
                 "🍵 Brew cancelled — that didn't look like a topic. "
                 "Tap 🍵 Brew again when you have a real question."
             )
             return
-        mode = state.settings.mode or "default"
-        await run_pipeline_for_telegram(
-            update=update, context=ctx, topic=topic, mode=mode,
-            extra={"brew_render": True},
-        )
-        return
-
-    if _looks_like_idle_chat(topic):
         welcome = _WELCOME_RU if _looks_russian(topic) else _WELCOME_EN
         await update.message.reply_text(welcome)
         return
 
     state.pending_topic = topic
+    state.pending_brew = is_brew
     text, kb = _confirm_prompt(
-        topic, ru=_looks_russian(topic), s=state.settings,
+        topic, ru=_looks_russian(topic), s=state.settings, brew=is_brew,
     )
     await update.message.reply_text(
         text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN,
@@ -1555,7 +1570,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "idea:confirm":
         topic = state.pending_topic
+        is_brew = state.pending_brew
         state.pending_topic = None
+        state.pending_brew = False
         if not topic:
             # Stale button click (bot restarted, or already confirmed).
             try:
@@ -1570,7 +1587,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # the prior anchors the hallucination. Parse here so the user can
         # pick Lucid from the menu and then just type 'prior | topic' as
         # their next message — no slash command needed.
-        extra: dict | None = None
+        extra: dict = {"brew_render": True} if is_brew else {}
         if mode == "lucid":
             sep = None
             if "|" in topic:
@@ -1580,7 +1597,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if sep:
                 prior, _, lucid_topic = topic.partition(sep)
                 topic = lucid_topic.strip()
-                extra = {"lucid_prior": prior.strip()}
+                extra["lucid_prior"] = prior.strip()
             else:
                 # No prior supplied — explain the format and abort gracefully.
                 msg = (
@@ -1601,20 +1618,23 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
         mode_lab = _mode_label(mode)
+        brew_tag = " · 🍵 Brew" if is_brew else ""
         ack = (
-            f"✅ Запускаю генерацию ({mode_lab}) для: «{topic[:200]}»"
+            f"✅ Запускаю генерацию ({mode_lab}{brew_tag}) для: «{topic[:200]}»"
             if ru
-            else f"✅ Generating ideas ({mode_lab}) for: «{topic[:200]}»"
+            else f"✅ Generating ideas ({mode_lab}{brew_tag}) for: «{topic[:200]}»"
         )
         try:
             await query.edit_message_text(ack)
         except Exception:
             pass
         await run_pipeline_for_telegram(
-            update=update, context=ctx, topic=topic, mode=mode, extra=extra,
+            update=update, context=ctx, topic=topic, mode=mode,
+            extra=extra or None,
         )
     elif data == "idea:cancel":
         state.pending_topic = None
+        state.pending_brew = False
         ru = _looks_russian(query.message.text if query.message else "")
         msg = (
             "❌ Отменено — сообщение не отправлено в генерацию."
