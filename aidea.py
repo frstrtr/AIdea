@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import asyncio
+import contextvars
 import hashlib
 import json
 import random
@@ -341,6 +342,16 @@ class Card:
     # so high-aligned cards rise, mimicking the brain's structure-mapping
     # bias (Gentner) on top of the entropy radius.
     alignment_score: int | None = None
+    # Anti-fatigue Layer 1: 1.0 by default, set to <1.0 in sample_cards when
+    # the card's domain has appeared in the current user's last N runs.
+    # Multiplied into the sampling weight to soft-downweight repeats.
+    novelty_penalty: float = 1.0
+    # Anti-fatigue Layer 2: one of pragmatic / poetic / contrarian /
+    # nostalgic / forensic / playful (see MOOD_TAGS). Populated by the
+    # alignment+mood batch scorer when AIDEA_STRUCTURE_BIAS is on. Used
+    # in sample_cards to rotate AWAY from moods the user has seen
+    # recently, fighting per-user theme fatigue.
+    mood_tag: str | None = None
 
     def render(self) -> str:
         """Render the card for the synthesizer prompt."""
@@ -671,6 +682,24 @@ async def generate_deck(
         topic, n, depth, themes=themes or None, warm_start=warm_block,
     )
 
+    # Anti-fatigue Layer 3 wildcard injection: when load_or_generate_deck
+    # has detected this user's novelty curve is flattening, append an
+    # explicit "wander further" instruction so the deck-gen model knows
+    # to pull from less-obvious donor neighbourhoods than its default for
+    # this topic. ContextVar is set per pipeline run.
+    if _saturated_run.get():
+        prompt += (
+            "\n\nWILDCARD WANDER: this user has been seeing similar donor "
+            "themes recently. For this deck only, deliberately pull from "
+            "donor domains far from the obvious neighbourhood of the topic — "
+            "domains the model would NOT normally pick on the first pass for "
+            "a query like this. Bias toward unexpected fields, sub-cultures, "
+            "historical practices, niche industries. Still feasibility-bound "
+            "in the synthesizer downstream, so the cards can be wild on "
+            "domain origin but should each still have a real mechanism worth "
+            "describing.\n"
+        )
+
     if verbose:
         print(f"[deck] generating {n} cards at depth={depth.name}...", flush=True)
     text = await _run_query(prompt, DECK_GEN_SYSTEM, model, kind="deck")
@@ -690,6 +719,31 @@ async def load_or_generate_deck(
     theme_entropy: float = 0.5,
     themes: list[str] | None = None,
 ) -> list[Card]:
+    # Anti-fatigue Layer 3: per-user saturation alarm. If this user's
+    # last-week donor-domains overlap their prior-week donors above the
+    # threshold, force a fresh deck-gen + wildcard wander instruction.
+    # Bypasses cache so the same topic for the same user actually gets
+    # a different deck on consecutive runs once saturation is detected.
+    saturated = False
+    try:
+        from retention import donor_repeat_rate, SATURATION_THRESHOLD
+        from transcripts import current_source
+        src = current_source() or ""
+        if src:
+            rate = donor_repeat_rate(src, days=7)
+            if rate >= SATURATION_THRESHOLD:
+                saturated = True
+                force_regen = True  # invalidate cache for this run
+                _saturated_run.set(True)
+                if verbose:
+                    print(
+                        f"[novelty] saturation alarm: 7d repeat rate {rate:.2f} "
+                        f"≥ {SATURATION_THRESHOLD:.2f} — forcing fresh deck + wider wander",
+                        flush=True,
+                    )
+    except Exception:
+        pass
+
     path = _deck_cache_path(topic, n, depth, model)
     if path.exists() and not force_regen:
         if verbose:
@@ -713,27 +767,58 @@ async def load_or_generate_deck(
             print(f"[deck] cached {len(cards)} cards to {path}", flush=True)
 
     # Optional brain-inspired structural-alignment scoring (Gentner
-    # structure-mapping). When AIDEA_STRUCTURE_BIAS is on, score every
-    # card 0-100 on whether its core mechanism actually maps onto the
-    # user's problem, then attach the score so sample_cards can use
-    # weighted within-domain selection instead of uniform random.
+    # structure-mapping) + Layer-2 mood tagging. When AIDEA_STRUCTURE_BIAS
+    # is on, one batch LLM call scores every card 0-100 on whether its
+    # core mechanism actually maps onto the user's problem AND tags it
+    # with a mood (pragmatic/poetic/contrarian/nostalgic/forensic/playful).
+    # sample_cards uses both: alignment weights within-domain selection
+    # toward structural fits; mood biases AWAY from moods the user has
+    # seen recently, fighting per-user theme fatigue.
     if os.environ.get("AIDEA_STRUCTURE_BIAS", "").strip() not in ("", "0", "false", "False"):
         try:
             scores = await score_alignment(topic, cards, model)
             for c in cards:
-                c.alignment_score = scores.get(c.name)
+                entry = scores.get(c.name) or {}
+                c.alignment_score = entry.get("alignment")
+                c.mood_tag = entry.get("mood")
             if verbose:
-                vals = [s for s in scores.values()]
+                vals = [e.get("alignment", 50) for e in scores.values() if isinstance(e, dict)]
+                moods = [e.get("mood") for e in scores.values() if isinstance(e, dict) and e.get("mood")]
                 if vals:
                     print(
-                        f"[deck] structural alignment scored: "
-                        f"mean {sum(vals)/len(vals):.0f} · "
-                        f"range {min(vals)}–{max(vals)}",
+                        f"[deck] alignment scored: mean {sum(vals)/len(vals):.0f} · "
+                        f"range {min(vals)}–{max(vals)} · "
+                        f"moods tagged: {len(moods)}/{len(scores)}",
                         flush=True,
                     )
         except Exception as e:
             if verbose:
                 print(f"[deck] alignment scoring failed ({e}); falling back to uniform sampling", flush=True)
+
+    # Anti-fatigue Layer 1: per-user donor cooldown. Annotate each card
+    # with a novelty_penalty < 1.0 if its domain appeared in the user's
+    # last 3 runs. sample_cards multiplies the sampling weight by this
+    # to soft-downweight repeat domains. Cheap — one transcripts.jsonl
+    # scan, no LLM call.
+    try:
+        from retention import recent_card_domains
+        from transcripts import current_source
+        src = current_source() or ""
+        if src:
+            seen = recent_card_domains(src, n_runs=3)
+            n_cool = 0
+            for c in cards:
+                if c.domain in seen:
+                    c.novelty_penalty = 0.4
+                    n_cool += 1
+            if verbose and n_cool:
+                print(
+                    f"[novelty] cooldown applied to {n_cool}/{len(cards)} cards "
+                    f"(domain seen in user's last 3 runs)",
+                    flush=True,
+                )
+    except Exception:
+        pass
 
     # Ingest into the per-source corpus on every pipeline run, including
     # cache hits — the deck cache is keyed by topic/depth/model and is
@@ -784,24 +869,65 @@ def sample_cards(
     (tight transplants); at high ``spread`` the weights flatten toward
     uniform so AIdea's signature surprise isn't smothered. Domain-
     hopping at rate ``spread`` is unchanged either way.
+
+    Anti-fatigue stack (applied to the within-domain weight, on top of
+    alignment scoring):
+      Layer 1: ``novelty_penalty`` (set by load_or_generate_deck when the
+        card's domain was in the user's last 3 runs) multiplies the
+        weight by 0.4, soft-suppressing repeat domains.
+      Layer 2: cards whose ``mood_tag`` does NOT appear in the user's
+        recent moods get a 1.5× boost so the engine rotates away from
+        whatever flavour the user has been getting.
+      Layer 3: if _saturated_run is set (saturation alarm fired) spread
+        is floored at 0.65 (insane minimum) so the cross-domain hop rate
+        rises — combined with the wildcard prompt injection in
+        generate_deck, this is the explicit BeReal-Day-200 defense.
     """
     if not deck:
         raise ValueError("Deck is empty.")
 
+    # Layer 3 spread floor — see docstring.
+    if _saturated_run.get():
+        spread = max(spread, 0.65)
+
+    # Layer 2 mood rotation — load the user's recent moods once and
+    # boost cards whose mood is NOT in the recent set. If we have no
+    # source / no history / no mood tags yet, this is a no-op.
+    recent_moods: set[str] = set()
+    try:
+        from retention import recent_mood_tags
+        from transcripts import current_source
+        src = current_source() or ""
+        if src:
+            counter = recent_mood_tags(src, n_runs=3)
+            # Mood is "recently seen" if it appears at least twice in the
+            # last 3 runs — single occurrences don't count, since most
+            # decks have a mix of moods anyway and 1-hit doesn't signal
+            # a pattern worth rotating away from.
+            recent_moods = {m for m, k in counter.items() if k >= 2}
+    except Exception:
+        recent_moods = set()
+
     def _weight(c: Card) -> float:
-        # If no alignment scoring happened, return 1.0 so rng.choices
-        # degenerates to uniform — equivalent to the old rng.choice path.
+        # Baseline (alignment-aware if scored, else uniform 1.0).
         if c.alignment_score is None:
-            return 1.0
-        # Linear blend: at spread=0 weight = alignment_score (tight pull
-        # toward high-aligned cards); at spread=1 weight = 50 (constant,
-        # so sampling is uniform). Keeps the entropy knob authoritative.
-        return c.alignment_score * (1.0 - spread) + 50.0 * spread
+            base = 1.0
+        else:
+            base = c.alignment_score * (1.0 - spread) + 50.0 * spread
+
+        # Layer 1 cooldown.
+        base *= getattr(c, "novelty_penalty", 1.0) or 1.0
+
+        # Layer 2 mood rotation — 1.5× for unseen-recently moods.
+        if c.mood_tag and recent_moods and c.mood_tag not in recent_moods:
+            base *= 1.5
+
+        return max(0.01, base)
 
     def _pick(pool: list[Card]) -> Card:
         weights = [_weight(c) for c in pool]
         # Guard against degenerate all-zero (shouldn't happen — _weight
-        # floors at uniform 50) by falling back to plain choice.
+        # floors at 0.01) by falling back to plain choice.
         if not any(w > 0 for w in weights):
             return rng.choice(pool)
         return rng.choices(pool, weights=weights, k=1)[0]
@@ -1816,11 +1942,24 @@ def total_score(score: dict) -> int:
 # ---------------------------------------------------------------------------
 
 
+# Mood-tag vocabulary for anti-fatigue Layer 2. Closed set so rotation
+# is meaningful (a free-form mood per card would produce an unbounded
+# tag space and never rotate). Six tags cover the emotional axes that
+# differentiate donor concepts the most — pragmatic/poetic, contrarian/
+# nostalgic, forensic/playful — based on the donor-domain spread we've
+# seen in real traffic (cooking, infra, art, philosophy, etc.).
+MOOD_TAGS: tuple[str, ...] = (
+    "pragmatic", "poetic", "contrarian",
+    "nostalgic", "forensic", "playful",
+)
+
+
 ALIGNMENT_SYSTEM = (
-    "You score donor concepts by structural alignment to a user's stated "
-    "problem. Output STRICT JSON only — one object mapping card-name to "
-    "an integer 0-100, no commentary, no fences. The JSON keys stay verbatim "
-    "in whatever language the card names are written (do not translate them)."
+    "You score donor concepts on TWO axes — structural alignment to a "
+    "user's stated problem, and a closed-set mood tag. Output STRICT JSON "
+    "only — one object per card, no commentary, no fences. The JSON keys "
+    "(card names) stay verbatim in whatever language they were written; "
+    "do not translate them."
 )
 
 
@@ -1829,32 +1968,41 @@ User problem / project / question:
 
   {topic}
 
-Score each of the donor concepts below on STRUCTURAL ALIGNMENT to that
-problem, on a 0-100 scale.
+For each donor concept below, return TWO things:
 
+(1) STRUCTURAL ALIGNMENT to the user's problem, 0-100 integer:
   - 100 = the donor's core relational schema (constraint shape, dynamic,
     transformation pattern) directly transplants onto this problem — a
     competent person seeing both would immediately see the analogy.
-  - 50  = it could plausibly transplant with creative work; the schemas
-    have partial overlap.
-  - 0   = there is no mappable structural correspondence; reusing this
-    donor would only work as decoration, not as load-bearing mechanism.
+  - 50  = it could plausibly transplant with creative work; partial overlap.
+  - 0   = no mappable structural correspondence; decoration only.
 
-This is NOT feasibility, NOT topic-fit, NOT novelty. Pure
-structure-mapping in Dedre Gentner's sense: do the relations between
-the donor's parts match the relations the user's problem needs?
+  This is NOT feasibility, NOT topic-fit, NOT novelty. Pure
+  structure-mapping in Dedre Gentner's sense: do the relations between
+  the donor's parts match the relations the user's problem needs?
 
-Use the full range. Most donors should land in 20-70; reserve 80+ for
-cases where the mechanism is genuinely a structural match, and 0-20
-for clear non-fits.
+  Use the full range. Most donors should land in 20-70; reserve 80+ for
+  genuine structural matches, 0-20 for clear non-fits.
+
+(2) MOOD TAG, exactly one of:
+    pragmatic   — concrete, ops-flavoured, "ship it tomorrow"
+    poetic      — metaphorical, image-led, evocative
+    contrarian  — challenges a consensus assumption
+    nostalgic   — uses old / pre-digital / craft mechanisms
+    forensic    — investigative, root-cause, dissection-style
+    playful     — game-like, mischievous, low-stakes
+  Pick the dominant flavour of the donor; ignore the user's problem when
+  picking the mood (mood is a property of the donor, not the fit).
 
 Donor concepts:
 
 {card_list}
 
 Respond as ONE JSON object only, with one entry per card. Keys are the
-EXACT card names verbatim (no edits, no translation), values are
-integers 0-100. Example shape: {{"Card Name A": 72, "Card Name B": 35}}.
+EXACT card names verbatim (no edits, no translation). Values are objects
+of shape {{"a": <int 0-100>, "m": "<mood>"}}. Example:
+  {{"Card Name A": {{"a": 72, "m": "pragmatic"}},
+    "Card Name B": {{"a": 35, "m": "poetic"}}}}
 """
 
 
@@ -1862,11 +2010,14 @@ async def score_alignment(
     topic: str,
     cards: list[Card],
     model: str,
-) -> dict[str, int]:
-    """Return {card.name: 0-100 alignment} for every card in the deck.
+) -> dict[str, dict]:
+    """Return {card.name: {"alignment": 0-100, "mood": str|None}} for every
+    card in the deck.
 
-    Single batch LLM call — caller is expected to apply the scores by
-    setting ``card.alignment_score`` before sampling.
+    Single batch LLM call — caller applies the scores by setting
+    ``card.alignment_score`` and ``card.mood_tag`` before sampling.
+    Combined into one call so the mood-tag scoring (Layer 2 of the
+    anti-fatigue stack) costs zero extra tokens vs. alignment alone.
     """
     if not cards:
         return {}
@@ -1878,15 +2029,39 @@ async def score_alignment(
     raw = await _query_text(prompt, ALIGNMENT_SYSTEM, model, kind="alignment")
     obj = _try_parse_json_object(raw) or {}
 
-    out: dict[str, int] = {}
+    out: dict[str, dict] = {}
     for c in cards:
-        v = obj.get(c.name)
-        try:
-            out[c.name] = max(0, min(100, int(float(v))))
-        except (TypeError, ValueError):
-            # Unscored cards default to mid-range so they aren't filtered out.
-            out[c.name] = 50
+        entry = obj.get(c.name)
+        alignment: int = 50
+        mood: str | None = None
+        # The new schema is {"a": int, "m": str}; the legacy schema was
+        # just an int. Accept both so an old prompt response or a malformed
+        # response degrades gracefully.
+        if isinstance(entry, dict):
+            try:
+                alignment = max(0, min(100, int(float(entry.get("a", 50)))))
+            except (TypeError, ValueError):
+                alignment = 50
+            m = entry.get("m")
+            if isinstance(m, str) and m.strip().lower() in MOOD_TAGS:
+                mood = m.strip().lower()
+        elif isinstance(entry, (int, float, str)):
+            try:
+                alignment = max(0, min(100, int(float(entry))))
+            except (TypeError, ValueError):
+                alignment = 50
+        out[c.name] = {"alignment": alignment, "mood": mood}
     return out
+
+
+# Anti-fatigue Layer 3 saturation flag. set by load_or_generate_deck when
+# donor_repeat_rate crosses the threshold; read by generate_deck (for the
+# wildcard prompt injection) and sample_cards (for the spread floor).
+# ContextVar so it propagates across awaits within the current pipeline
+# run without polluting any function signatures.
+_saturated_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "aidea_saturated_run", default=False,
+)
 
 
 REFINE_PROMPT_TEMPLATE = """\
