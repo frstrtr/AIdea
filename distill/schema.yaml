@@ -1,0 +1,38 @@
+# OmniLang typed-token schema for AIdea theme distillation.
+#
+# Purpose: train a small local model to replace the current
+# `generate_themes` LLM call (~2k input tokens, ~$0.01, +10s wall) with
+# CPU-inference theme generation.
+#
+# Output shape — completion looks like:
+#
+#   <T:> harbor pilotage <T:> monastic rules <T:> mycorrhizal symbiosis <T:> ...
+#
+# The `<E:*>` tokens condition the prompt on the requested theme-entropy
+# bucket so the same model serves all five entropy levels. They live in
+# the PROMPT side; only `<T:>` appears in the completion.
+
+name: aidea_themes
+description: >
+  Donor-domain ('theme') selection for AIdea topic preprocessing.
+  One separator token plus five entropy-bucket conditioning tokens.
+
+tokens:
+  # Theme separator — appears in both prompt scaffolding and completion.
+  # Lives between every domain name. Token id is short on purpose so
+  # tokenizer extension stays cheap.
+  - id: "<T:>"
+    aliases: ["theme:", "domain:", "next theme", "•", "—"]
+
+  # Entropy bucket conditioning — exactly mirrors aidea.ENTROPY_LEVELS
+  # so the trained model can serve sane→mad without retraining.
+  - id: "<E:sane>"
+    aliases: ["sane", "conservative", "familiar", "stay close"]
+  - id: "<E:wild>"
+    aliases: ["wild", "uncommon", "surprising"]
+  - id: "<E:insane>"
+    aliases: ["insane", "transplant", "unrelated domain"]
+  - id: "<E:crazy>"
+    aliases: ["crazy", "reckless", "challenge an assumption"]
+  - id: "<E:mad>"
+    aliases: ["mad", "reinterpret", "absurd", "fictional but feasible"]
