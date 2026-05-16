@@ -1512,19 +1512,17 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     elif data == "menu:help":
         # Send help as a fresh message (HELP_TEXT is long, edit-in-place would
         # blow past Telegram's 4096-char button-message limit).
-        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT) if False else None
         await ctx.bot.send_message(chat_id=chat_id, text=HELP_TEXT)
 
     elif data == "menu:usage":
-        await ctx.bot.send_message(chat_id=chat_id, text="Pulling current usage...")
-        # Reuse cmd_usage's logic by calling it with a synthesized message-less update.
         try:
             from usage import summarize
             u = summarize()
             run = u.get("total", {}) or {}
+            calls = int(run.get("calls", 0) or 0)
             txt = (
                 f"📈 *Usage (all time)*\n"
-                f"  calls: {fmt_num(run.get('calls', 0))}\n"
+                f"  calls: {calls}\n"
                 f"  tokens out: {fmt_tokens(run.get('output_tokens', 0))}\n"
                 f"  cost: {fmt_usd(run.get('total_cost_usd', 0))}"
             )
