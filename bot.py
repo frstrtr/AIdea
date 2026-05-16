@@ -1492,10 +1492,35 @@ def _confirm_prompt(
             f"{params}\n\n{confirm_tail_en}"
         )
         yes, no = "✅ Yes, generate", "❌ No, cancel"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(yes, callback_data="idea:confirm", style="success"),
-        InlineKeyboardButton(no, callback_data="idea:cancel", style="danger"),
-    ]])
+
+    # Brew rides the same confirmation card but has THREE choices:
+    # run it now, or schedule for +3h / +8h ("appointment hook" — the
+    # core retention lever from idea 5). Regular ideation keeps the
+    # plain Yes/No.
+    if brew:
+        if ru:
+            now_lab, later_lab, morning_lab, cancel_lab = (
+                "⚡ Сейчас", "☕ Через 3ч", "🌅 Через 8ч", "❌ Отмена",
+            )
+        else:
+            now_lab, later_lab, morning_lab, cancel_lab = (
+                "⚡ Now", "☕ In 3h", "🌅 In 8h", "❌ Cancel",
+            )
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(now_lab,    callback_data="brew:now",    style="success"),
+                InlineKeyboardButton(later_lab,  callback_data="brew:3h",     style="primary"),
+                InlineKeyboardButton(morning_lab, callback_data="brew:8h",    style="primary"),
+            ],
+            [
+                InlineKeyboardButton(cancel_lab, callback_data="brew:cancel", style="danger"),
+            ],
+        ])
+    else:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(yes, callback_data="idea:confirm", style="success"),
+            InlineKeyboardButton(no, callback_data="idea:cancel", style="danger"),
+        ]])
     return text, kb
 
 
@@ -1643,6 +1668,95 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         try:
             await query.edit_message_text(msg)
+        except Exception:
+            pass
+
+    elif data.startswith("brew:drop_"):
+        # /brews → ❌ Cancel #N
+        try:
+            bid = int(data.split("_", 1)[1])
+        except (ValueError, IndexError):
+            return
+        import brew_queue
+        ok = brew_queue.cancel(bid, chat_id)
+        msg = (
+            f"❌ Brew #{bid} cancelled." if ok
+            else f"⚠️ Brew #{bid} can't be cancelled (already running or delivered)."
+        )
+        try:
+            await query.edit_message_text(msg)
+        except Exception:
+            pass
+
+    elif data in ("brew:now", "brew:3h", "brew:8h", "brew:cancel"):
+        topic = state.pending_topic
+        state.pending_topic = None
+        state.pending_brew = False
+        ru = _looks_russian(topic or "")
+        if data == "brew:cancel" or not topic:
+            msg = (
+                "❌ Brew отменён — сообщение не отправлено."
+                if ru else "❌ Brew cancelled — your message was not submitted."
+            )
+            try:
+                await query.edit_message_text(msg)
+            except Exception:
+                pass
+            return
+
+        mode = state.settings.mode or "default"
+        if data == "brew:now":
+            # Existing flow: run immediately with card render.
+            ack = (
+                f"✅ Запускаю Brew ({_mode_label(mode)}) для: «{topic[:200]}»"
+                if ru else
+                f"✅ Brewing now ({_mode_label(mode)}) for: «{topic[:200]}»"
+            )
+            try:
+                await query.edit_message_text(ack)
+            except Exception:
+                pass
+            await run_pipeline_for_telegram(
+                update=update, context=ctx, topic=topic, mode=mode,
+                extra={"brew_render": True},
+            )
+            return
+
+        # Scheduled paths: write to brew_queue, return immediately.
+        import brew_queue
+        delay = 3 * 3600 if data == "brew:3h" else 8 * 3600
+        reveal_at = time.time() + delay
+        try:
+            brew_id = brew_queue.schedule(
+                chat_id=chat_id, topic=topic, mode=mode,
+                reveal_at=reveal_at,
+            )
+        except Exception as e:
+            log.exception("brew_queue.schedule failed")
+            try:
+                await query.edit_message_text(
+                    f"⚠️ Couldn't schedule the Brew: {e}\nFalling back to /brew run now.",
+                )
+            except Exception:
+                pass
+            return
+
+        when_local = time.strftime("%H:%M", time.localtime(reveal_at))
+        delay_lab = "3 hours" if data == "brew:3h" else "8 hours"
+        delay_lab_ru = "3 часа" if data == "brew:3h" else "8 часов"
+        ack = (
+            f"🍵 *Brew поставлен в очередь* (#{brew_id})\n\n"
+            f"Тема: «{topic[:200]}»\n"
+            f"Дойдёт через {delay_lab_ru} (~{when_local}).\n\n"
+            f"_Отменить: `/brews` → нажмите ❌ рядом с этим брю._"
+            if ru else
+            f"🍵 *Brew queued* (#{brew_id})\n\n"
+            f"Topic: «{topic[:200]}»\n"
+            f"Ready in {delay_lab} (~{when_local}).\n\n"
+            f"_Cancel: `/brews` → tap ❌ next to this brew._"
+        )
+        try:
+            await query.edit_message_text(ack, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             pass
 
@@ -2132,6 +2246,179 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
+# Scheduled-Brew worker — pulled from brew_queue, runs the minimal
+# headless pipeline (deck-gen → sample → synth → critic winner pick →
+# Pillow render), delivers as one photo with a single header line.
+# Wired into PTB JobQueue in build_app(); polls every 60s.
+# ---------------------------------------------------------------------------
+
+
+async def _brew_worker_run(bot: Any, row: dict) -> None:
+    """Process one due Brew end-to-end. Caller has already called
+    brew_queue.claim() on this row (so status is 'brewing'), so on
+    success / failure we update status and stop."""
+    import brew_queue
+    from brew_render import (
+        render_card,
+        parse_idea_fields,
+        default_output_path,
+    )
+    from aidea import (
+        load_or_generate_deck,
+        sample_cards,
+        build_prompt,
+        synthesize,
+        critic_score,
+        total_score,
+        parse_entropy,
+        CARD_DEPTH_BY_NAME,
+    )
+    from usage import start_run
+    from transcripts import set_source, log_event as transcript_log
+
+    brew_id = row["id"]
+    chat_id = row["chat_id"]
+    topic = row["topic"]
+    mode = (row.get("mode") or "default")
+
+    run_id = start_run(f"tg-{chat_id}")
+    set_source(f"telegram-{chat_id}")
+    transcript_log(
+        "request_started",
+        topic=topic, mode=mode, brew_id=brew_id,
+        scheduled=True,
+    )
+
+    try:
+        # Minimal pipeline — single idea, default knobs. Refine off (a
+        # scheduled brew shouldn't double its runtime budget). Mode is
+        # honoured for the synthesis prompt but multi-idea modes
+        # (einstein/futures) deliver the first idea only — the Brew
+        # card carries ONE idea, by design.
+        spread, level = parse_entropy("wild")
+        depth = CARD_DEPTH_BY_NAME["medium"]
+        deck = await load_or_generate_deck(
+            topic=topic, n=30, depth=depth,
+            model="claude-opus-4-7",
+            force_regen=False, verbose=False,
+        )
+        import random
+        rng = random.Random()
+        cards = sample_cards(deck=deck, n=3, spread=spread, rng=rng)
+        prompt = build_prompt(topic, cards, level)
+        idea_text = await synthesize(
+            prompt=prompt, model="claude-opus-4-7", stream_to_stdout=False,
+        )
+        transcript_log(
+            "idea", i=0, mechanism=None, text=idea_text,
+            cards=[{k: v for k, v in c.__dict__.items() if v is not None}
+                   for c in cards],
+        )
+
+        fields = parse_idea_fields(idea_text)
+        png_path = render_card(
+            title=fields.get("title") or topic[:60],
+            pitch=fields.get("pitch", ""),
+            mechanism=fields.get("mechanism", ""),
+            first_step=fields.get("first_step", ""),
+            output_path=default_output_path(brew_id=brew_id),
+        )
+
+        # Deliver as one photo with the topic as a small header caption.
+        # The card itself carries the substance; caption is just context.
+        with png_path.open("rb") as f:
+            msg = await bot.send_photo(
+                chat_id=chat_id,
+                photo=f,
+                caption=(
+                    f"☕ Your Brew is ready.\n"
+                    f"Topic: «{topic[:200]}»"
+                ),
+            )
+        brew_queue.mark_delivered(
+            brew_id=brew_id,
+            message_id=msg.message_id,
+            result_path=str(png_path),
+        )
+        transcript_log("request_completed", n_ideas=1, brew_id=brew_id)
+    except Exception as e:
+        log.exception("brew worker failed for brew_id=%s", brew_id)
+        transcript_log("request_errored", error_type=type(e).__name__, error=str(e))
+        brew_queue.mark_failed(brew_id, str(e))
+        # Tell the user something went wrong so they don't wait forever.
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Your Brew (#{brew_id}) couldn't finish. "
+                    f"Try sending the topic again, or run /brew now."
+                ),
+            )
+        except Exception:
+            pass
+
+
+async def brew_poll_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB JobQueue callback — runs every 60 s. Pulls due brews from
+    SQLite, processes them serially so one stuck pipeline can't block
+    a queue or burn the rate-limit by parallel claude subprocess fan-
+    out."""
+    import brew_queue
+    try:
+        due = brew_queue.due_brews(limit=5)
+    except Exception:
+        log.exception("brew_poll_callback: due_brews failed")
+        return
+    for row in due:
+        # Atomic pending → brewing. Skip if another worker beat us.
+        if not brew_queue.claim(row["id"]):
+            continue
+        await _brew_worker_run(context.bot, row)
+
+
+async def cmd_brews(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the user's pending + last-5 historical brews, with inline
+    ❌ buttons to cancel any still-pending entry."""
+    import brew_queue
+    chat_id = update.effective_chat.id
+    pending = brew_queue.pending_for_chat(chat_id, limit=10)
+    history = brew_queue.history_for_chat(chat_id, limit=5)
+    lines = ["🍵 *Your brews*"]
+    if pending:
+        lines.append("\n*Pending:*")
+        for b in pending:
+            when = time.strftime("%H:%M", time.localtime(b["reveal_at"]))
+            dt = b["reveal_at"] - time.time()
+            mins = max(0, int(dt / 60))
+            lines.append(
+                f"  • #{b['id']}  ({when}, in {mins}m)  «{b['topic'][:60]}»"
+            )
+    else:
+        lines.append("\n_No pending brews. Tap 🍵 Brew on the menu to schedule one._")
+    if history:
+        lines.append("\n*Recent:*")
+        for b in history:
+            stat = b["status"]
+            icon = {"delivered": "✅", "failed": "⚠️", "pending": "⏳", "brewing": "🔄"}.get(stat, "·")
+            when = time.strftime("%m-%d %H:%M", time.localtime(b["created_at"]))
+            lines.append(f"  {icon} {when}  «{b['topic'][:50]}»")
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for b in pending[:5]:
+        kb_rows.append([InlineKeyboardButton(
+            f"❌ Cancel #{b['id']}",
+            callback_data=f"brew:drop_{b['id']}",
+            style="danger",
+        )])
+    kb = InlineKeyboardMarkup(kb_rows) if kb_rows else None
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
 
@@ -2148,6 +2435,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("idea", cmd_idea))
     app.add_handler(CommandHandler("brew", cmd_brew))
+    app.add_handler(CommandHandler("brews", cmd_brews))
     app.add_handler(CommandHandler("einstein", cmd_einstein))
     app.add_handler(CommandHandler("lsd", cmd_lsd))
     app.add_handler(CommandHandler("futures", cmd_futures))
@@ -2165,12 +2453,32 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_message))
     # Yes/No buttons for the plain-text confirmation flow.
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^idea:(confirm|cancel)$"))
+    app.add_handler(CallbackQueryHandler(
+        on_callback,
+        pattern=r"^(idea:(confirm|cancel)|brew:(now|3h|8h|cancel|drop_\d+))$",
+    ))
     # Sub-pickers opened from the bottom-attached menu (Mode/Entropy/Depth).
     app.add_handler(CallbackQueryHandler(
         on_menu_callback,
         pattern=r"^(mode:|entropy:|depth:)",
     ))
+    # Scheduled-Brew queue: init the SQLite store and start the poller.
+    # Runs every 60s, processes up to 5 due brews per tick serially.
+    try:
+        import brew_queue
+        brew_queue.init_db()
+        if app.job_queue is not None:
+            app.job_queue.run_repeating(
+                brew_poll_callback,
+                interval=60.0,
+                first=15.0,
+                name="brew_poll",
+            )
+            log.info("brew queue + poller registered")
+        else:
+            log.warning("PTB JobQueue unavailable — scheduled brews disabled")
+    except Exception:
+        log.exception("brew queue init failed — scheduled brews disabled")
     return app
 
 
