@@ -1,0 +1,35 @@
+# Domains the teacher over-uses across topics — derived from the path-A
+# dedupe stats. Each entry will be forbidden AND so will near-rephrasings
+# of it (different word order, RU/EN swaps, sub-categories of the same
+# craft).
+#
+# Add more lines as new bias patterns surface in future runs.
+harbor pilotage
+лоцманская проводка
+портовая лоцманская служба
+monastic rules
+монастырские уставы
+mycorrhizal symbiosis
+mycorrhizal nutrient exchange
+микоризный симбиоз
+falconry training
+дрессировка ловчих соколов
+lacquer restoration
+реставрация лаковой миниатюры
+реставрация японского лака уруси
+sourdough starter maintenance
+fresco restoration
+реставрация фресок
+medieval bestiaries
+средневековые бестиарии
+portolan charts
+картография портоланов
+reservoir sedimentation
+седиментация водохранилищ
+coral reef cleaning stations
+diplomatic pouch chain-of-custody
+lighthouse keeper logbooks
+tea ceremony rituals
+ритуалы чайной церемонии
+bird-of-paradise mating dance
+брачные танцы райских птиц
