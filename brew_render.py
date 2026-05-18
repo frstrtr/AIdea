@@ -282,3 +282,134 @@ def default_output_path(brew_id: int | str | None = None) -> Path:
     base.mkdir(parents=True, exist_ok=True)
     name = str(brew_id) if brew_id is not None else f"brew-{int(time.time())}"
     return base / f"{name}.png"
+
+
+# ---------------------------------------------------------------------------
+# Composite layout — illustrated Brew cards
+#
+# 1080×1920 canvas:
+#   - top    1080×1200  generated image (cropped/scaled center-fit)
+#   - bottom 1080× 720  text panel (dark BG, title + pitch + first step + wordmark)
+#
+# The text panel uses a darker variant of the existing palette so it
+# anchors the image visually rather than competing with it.
+# ---------------------------------------------------------------------------
+
+
+_IMAGE_PANEL_H = 1200
+_TEXT_PANEL_H = 1920 - _IMAGE_PANEL_H   # 720
+_TEXT_PANEL_BG = (12, 16, 22)            # slightly deeper than text-only card
+_TEXT_PAD = 64
+
+
+def _fit_into(src: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Scale + center-crop ``src`` into a (target_w × target_h) canvas without
+    leaving black bars. Preserves the source aspect by scaling to fill
+    then center-cropping the overflow axis."""
+    src_w, src_h = src.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w = int(round(src_w * scale))
+    new_h = int(round(src_h * scale))
+    resampled = src.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return resampled.crop((left, top, left + target_w, top + target_h))
+
+
+def render_card_with_image(
+    *,
+    image_path: Path,
+    title: str,
+    pitch: str = "",
+    first_step: str = "",
+    output_path: Path,
+    footer: str = "AIdea · brewed for you",
+) -> Path:
+    """Compose the illustrated Brew card — generated image on top, text
+    panel on bottom.
+
+    The mechanism block is intentionally omitted from the composite (it
+    fits in the text-only card but crowds the text panel under the
+    image). The illustration itself carries the mechanism metaphor;
+    the text band is for legibility of what the idea IS.
+    """
+    title = _strip_markdown(title or "Untitled brew")
+    pitch = _strip_markdown(pitch or "")
+    first_step = _strip_markdown(first_step or "")
+
+    canvas = Image.new("RGB", (WIDTH, HEIGHT), color=BG)
+
+    # ---- Image panel (top) -------------------------------------------------
+    try:
+        src = Image.open(image_path).convert("RGB")
+        cropped = _fit_into(src, WIDTH, _IMAGE_PANEL_H)
+        canvas.paste(cropped, (0, 0))
+    except Exception:
+        # Failed to load the image — fall back to a flat coloured panel
+        # so the card still renders (better than crashing the Brew run).
+        placeholder = Image.new(
+            "RGB", (WIDTH, _IMAGE_PANEL_H), color=(40, 50, 65),
+        )
+        canvas.paste(placeholder, (0, 0))
+
+    # ---- Text panel (bottom) -----------------------------------------------
+    panel = Image.new("RGB", (WIDTH, _TEXT_PANEL_H), color=_TEXT_PANEL_BG)
+    draw = ImageDraw.Draw(panel)
+
+    inner_w = WIDTH - 2 * _TEXT_PAD
+    y = 56
+
+    # Top accent line so the panel reads as a deliberate section, not a
+    # blank tray.
+    draw.line(
+        [(_TEXT_PAD, 26), (WIDTH - _TEXT_PAD, 26)],
+        fill=ACCENT, width=3,
+    )
+    # ☕ AIdea wordmark in the upper-left of the panel.
+    mark_font = _font(26, prefer_bold=True)
+    draw.text((_TEXT_PAD, 36), "☕ AIdea", fill=ACCENT, font=mark_font)
+    y = 90
+
+    # Title.
+    title_font = _font(48, prefer_bold=True)
+    y = _draw_block(
+        draw, _TEXT_PAD, y, title, title_font, FG,
+        max_width=inner_w, line_spacing=8,
+    )
+    y += 18
+
+    # Pitch (one line ideally).
+    if pitch:
+        pitch_font = _font(24)
+        y = _draw_block(
+            draw, _TEXT_PAD, y, pitch, pitch_font, (210, 215, 222),
+            max_width=inner_w, line_spacing=6,
+        )
+        y += 18
+
+    # First step — most actionable line, bottom-aligned to footer.
+    if first_step:
+        label_font = _font(18, prefer_bold=True)
+        draw.text(
+            (_TEXT_PAD, y), "FIRST STEP",
+            fill=ACCENT, font=label_font,
+        )
+        y += 30
+        body_font = _font(22, prefer_bold=True)
+        _draw_block(
+            draw, _TEXT_PAD, y, first_step, body_font, FG,
+            max_width=inner_w, line_spacing=6,
+        )
+
+    # Footer — always at the bottom of the panel.
+    foot_font = _font(18)
+    draw.text(
+        (_TEXT_PAD, _TEXT_PANEL_H - 40),
+        footer, fill=SUBTLE, font=foot_font,
+    )
+
+    canvas.paste(panel, (0, _IMAGE_PANEL_H))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path, format="PNG", optimize=True)
+    return output_path
