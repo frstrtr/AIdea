@@ -758,9 +758,11 @@ async def run_pipeline_for_telegram(
             try:
                 from brew_render import (
                     render_card,
+                    render_card_with_image,
                     parse_idea_fields,
                     default_output_path,
                 )
+                import brew_image
                 # Pick the best text: refined > critic-winner > first.
                 refined_text = locals().get("refined")
                 if refined_text:
@@ -770,13 +772,40 @@ async def run_pipeline_for_telegram(
                 else:
                     best_text = ideas[0]
                 fields = parse_idea_fields(best_text)
-                png_path = render_card(
-                    title=fields.get("title") or topic[:60],
-                    pitch=fields.get("pitch", ""),
-                    mechanism=fields.get("mechanism", ""),
-                    first_step=fields.get("first_step", ""),
-                    output_path=default_output_path(brew_id=run_id),
-                )
+                png_path: Path | None = None
+                # Illustrated path — Claude scene prompt + remote SDXL render
+                # + composite. Any failure (GPU host down, model not loaded,
+                # timeout) falls through to the existing text-only card so
+                # the user still gets something shareable.
+                if brew_image.is_enabled():
+                    try:
+                        img_path = default_output_path(
+                            brew_id=f"{run_id}-img",
+                        )
+                        png_img, scene = await brew_image.illustrate_idea(
+                            fields, img_path,
+                        )
+                        transcript_log("brew_image", scene=scene)
+                        png_path = render_card_with_image(
+                            image_path=png_img,
+                            title=fields.get("title") or topic[:60],
+                            pitch=fields.get("pitch", ""),
+                            first_step=fields.get("first_step", ""),
+                            output_path=default_output_path(brew_id=run_id),
+                        )
+                    except Exception:
+                        log.exception(
+                            "brew illustrated render failed — "
+                            "falling back to text-only card",
+                        )
+                if png_path is None:
+                    png_path = render_card(
+                        title=fields.get("title") or topic[:60],
+                        pitch=fields.get("pitch", ""),
+                        mechanism=fields.get("mechanism", ""),
+                        first_step=fields.get("first_step", ""),
+                        output_path=default_output_path(brew_id=run_id),
+                    )
                 with png_path.open("rb") as f:
                     await context.bot.send_photo(
                         chat_id=chat_id,

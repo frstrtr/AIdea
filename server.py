@@ -590,8 +590,12 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
         try:
             import base64
             from brew_render import (
-                render_card, parse_idea_fields, default_output_path,
+                render_card,
+                render_card_with_image,
+                parse_idea_fields,
+                default_output_path,
             )
+            import brew_image
             refined_text = locals().get("refined")
             if refined_text:
                 best_text = refined_text
@@ -600,13 +604,36 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             else:
                 best_text = ideas[0]
             fields = parse_idea_fields(best_text)
-            png_path = render_card(
-                title=fields.get("title") or req.topic[:60],
-                pitch=fields.get("pitch", ""),
-                mechanism=fields.get("mechanism", ""),
-                first_step=fields.get("first_step", ""),
-                output_path=default_output_path(brew_id=run_id),
-            )
+            png_path = None
+            # Illustrated path — Claude scene prompt + remote SDXL render
+            # + composite. Any failure falls through to the text-only card
+            # so the page still gets a renderable brew artifact.
+            if brew_image.is_enabled():
+                try:
+                    img_path = default_output_path(brew_id=f"{run_id}-img")
+                    png_img, scene = await brew_image.illustrate_idea(
+                        fields, img_path,
+                    )
+                    transcript_log("brew_image", scene=scene)
+                    png_path = render_card_with_image(
+                        image_path=png_img,
+                        title=fields.get("title") or req.topic[:60],
+                        pitch=fields.get("pitch", ""),
+                        first_step=fields.get("first_step", ""),
+                        output_path=default_output_path(brew_id=run_id),
+                    )
+                except Exception as e:
+                    yield _sse("progress", {
+                        "message": f"brew illustration unavailable ({e}) — using text-only card",
+                    })
+            if png_path is None:
+                png_path = render_card(
+                    title=fields.get("title") or req.topic[:60],
+                    pitch=fields.get("pitch", ""),
+                    mechanism=fields.get("mechanism", ""),
+                    first_step=fields.get("first_step", ""),
+                    output_path=default_output_path(brew_id=run_id),
+                )
             png_b64 = base64.b64encode(png_path.read_bytes()).decode("ascii")
             yield _sse("brew_card", {
                 "filename": png_path.name,
