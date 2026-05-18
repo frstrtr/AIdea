@@ -37,12 +37,18 @@ VRAM math for the GTX 1070 (8 GB):
   - SDXL UNet fp16:       ~5.0 GB
   - VAE + text encoders:  ~1.8 GB
   - Inference activations: ~1.0 GB
-  Total:                  ~7.8 GB  ← tight but fits without offload
+  Total:                  ~7.8 GB  ← would fit, but cross-attn allocs
+  push 7.91 GB card over the edge → CUDA OOM at first /render
 
-If we ever load a 1.5×-larger checkpoint we enable
-``enable_model_cpu_offload()`` to swap UNet → CPU between inferences
-(adds ~3 s/call but unblocks bigger models). For now, plain CUDA is
-the simplest fast path.
+Mitigation we apply (turn the knobs that have lowest quality cost):
+  - ``enable_attention_slicing("auto")`` chunks the [HW × HW] attention
+    matrix that OOMed our first run — peak memory drops ~5× without
+    the per-step CPU↔GPU transfer overhead (cpu_offload took 14s/step
+    on a 1070, 5+ min/image).
+  - ``vae.enable_slicing()`` + ``vae.enable_tiling()`` split the
+    final latent → 1024² pixel decode the same way.
+  - ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` reduces
+    allocator fragmentation across inferences.
 """
 from __future__ import annotations
 
@@ -51,6 +57,12 @@ import logging
 import os
 import time
 from typing import Optional
+
+# Must be set BEFORE the torch import so the CUDA caching allocator
+# picks it up. expandable_segments lets the allocator grow segments
+# in place, which avoids fragmentation when activation tensors of
+# varying sizes are allocated/freed across diffusion steps.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from diffusers import StableDiffusionXLPipeline
@@ -87,7 +99,13 @@ class RenderRequest(BaseModel):
 
 def _load_pipeline() -> StableDiffusionXLPipeline:
     """Load SDXL once. Picks fp16 on CUDA, falls back to fp32 on CPU
-    (which would be unusable in practice, but it doesn't crash)."""
+    (which would be unusable in practice, but it doesn't crash).
+
+    On the GTX 1070 (8 GB) we MUST enable model_cpu_offload() — the
+    plain ``.to("cuda")`` path loads the full UNet on-device and then
+    OOMs at the first cross-attention activation. cpu_offload swaps
+    sub-modules in/out as needed, costing ~3 s/render for the savings.
+    """
     log.info("loading pipeline: %s", MODEL_ID)
     t0 = time.time()
     pipe = StableDiffusionXLPipeline.from_pretrained(
@@ -98,7 +116,20 @@ def _load_pipeline() -> StableDiffusionXLPipeline:
         add_watermarker=False,
     )
     if torch.cuda.is_available():
-        pipe.to("cuda")
+        # The 8 GB GTX 1070 cannot hold the full SDXL model on GPU at
+        # once — pipe.to("cuda") takes 7.61 GiB leaving only 300 MiB
+        # for activations, which OOMs even at 768². cpu_offload moves
+        # sub-modules in/out per pipeline stage, freeing the headroom.
+        # Pair with attention slicing + VAE slicing/tiling to keep the
+        # per-step working-set within the freed VRAM.
+        pipe.enable_model_cpu_offload()
+        pipe.enable_attention_slicing("auto")
+        try:
+            pipe.vae.enable_slicing()
+            pipe.vae.enable_tiling()
+            log.info("attention + VAE slicing/tiling enabled")
+        except Exception:
+            log.warning("VAE slicing/tiling unavailable — large outputs may OOM")
         # Memory-efficient attention if xformers is available; otherwise
         # PyTorch's SDPA is good enough.
         try:

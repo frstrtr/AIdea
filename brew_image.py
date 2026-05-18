@@ -23,9 +23,12 @@ Env switches (read at use site, not import time):
 
   AIDEA_BREW_IMAGE_ENABLE   = 1 to turn on illustrated Brew
   AIDEA_BREW_IMAGE_HOST     = http://192.168.86.22:8765 (default)
-  AIDEA_BREW_IMAGE_TIMEOUT  = seconds, default 90 — generous because
-                              SDXL inference on a 1070 is 5-10s but
-                              first-call cold-start is 30-60s
+  AIDEA_BREW_IMAGE_TIMEOUT  = seconds, default 300 — Pascal-gen (1070)
+                              has no fp16 tensor cores and xformers is
+                              unavailable on its compute capability, so
+                              sustained SDXL at 1024² + 28 steps is
+                              30-60s and the first call adds another
+                              30-60s of CUDA/SDPA warmup
 """
 from __future__ import annotations
 
@@ -39,7 +42,11 @@ import httpx
 
 
 _DEFAULT_HOST = "http://192.168.86.22:8765"
-_DEFAULT_TIMEOUT = 90.0
+# 300s — the GTX 1070 (Pascal, no fp16 tensor cores, xformers unavailable)
+# does ~30-60s sustained per render and the first call adds 30-60s of
+# CUDA/SDPA warmup. 90s was too tight; 300s leaves headroom without
+# masking a genuinely stuck server.
+_DEFAULT_TIMEOUT = 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +148,8 @@ async def request_image(
     scene_prompt: str,
     output_path: Path,
     *,
-    width: int = 1024,
-    height: int = 1024,
+    width: int = 768,
+    height: int = 768,
     negative_prompt: str | None = (
         "text, letters, watermark, signature, words, numbers, "
         "chart, graph, low quality, blurry, jpeg artifacts, deformed"
@@ -153,9 +160,13 @@ async def request_image(
 ) -> Path:
     """POST to ``{host}/render`` and write the returned PNG to ``output_path``.
 
-    Width/height default to 1024×1024 (SDXL native) — we crop to the
-    target 1080×1200 in the composite step rather than asking the model
-    to render a non-square aspect, which produces better results on SDXL.
+    Width/height default to 768×768 — SDXL's native is 1024² but the
+    GTX 1070 (8 GB VRAM) needs cpu_offload + attention slicing to fit,
+    and at 1024² the final upsample still OOMs. 768² renders in ~55 s
+    on this hardware; the composite step (render_card_with_image) then
+    scales to 1080×1200, a 1.41× upscale that's invisible at the
+    thumb sizes the cards are shared at. Keep square so SDXL's
+    training-distribution aesthetics carry through.
     """
     host_url = (host or _host_url())
     body: dict[str, Any] = {
