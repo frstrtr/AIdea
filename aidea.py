@@ -987,6 +987,10 @@ Hard requirements (apply at EVERY audacity level — even "mad"):
     to try this week.
   - At least one donor concept must contribute the core structural
     mechanism, not just decoration or a name-drop.
+  - No gimmicks. Reject superficial mash-ups (two existing products glued
+    together), "X-but-for-Y" clones, and clever-sounding combinations that
+    don't change HOW the problem is solved. The borrowed mechanism must do
+    real work, not just supply a novel-sounding label.
 
 Respond in exactly this format, no preamble, no closing remarks:
 
