@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import html
 import json
 import os
 import random
@@ -201,12 +202,14 @@ async def _log_thread_id(context: Any, key: str) -> int | None:
 
 async def _log_to_group(
     context: Any, key: str, text: str, reply_to: int | None = None,
+    parse_mode: str | None = None,
 ) -> int | None:
     """Mirror an event into the monitoring group. Best-effort: any failure is
-    swallowed so logging can never break a user's pipeline. Plain text (no
-    Markdown) because user topics carry arbitrary characters. Returns the sent
-    message_id (so callers can thread replies under it), or None on failure.
-    Pass reply_to to post as a reply to an earlier message in the topic."""
+    swallowed so logging can never break a user's pipeline. Plain text by
+    default (no parse_mode) because user topics carry arbitrary characters;
+    pass parse_mode=ParseMode.HTML for cards built with escaped fields. Returns
+    the sent message_id (so callers can thread replies under it), or None on
+    failure. Pass reply_to to post as a reply to an earlier message."""
     chat_id = _log_chat_id()
     if chat_id is None:
         return None
@@ -221,11 +224,56 @@ async def _log_to_group(
             kwargs["message_thread_id"] = thread_id
         if reply_to is not None:
             kwargs["reply_to_message_id"] = reply_to
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
         msg = await context.bot.send_message(**kwargs)
         return msg.message_id if msg else None
     except Exception:
         log.exception("log-group post failed (key=%s)", key)
         return None
+
+
+# lols.bot spam/ban check — verified endpoint returns
+# {"ok":true,"user_id":N,"banned":bool}. Override host via env if it moves.
+_LOLS_URL = os.environ.get(
+    "AIDEA_LOLS_URL", "https://api.lols.bot/account?id={id}",
+)
+
+
+def _new_user_card(update: Update, topic: str) -> str:
+    """Rich HTML profile card for the 🆕 New users topic: clickable id-based
+    profile mention (name+surname), the raw fields, Android/iOS deeplinks, and
+    a lols spam-check link. All dynamic fields HTML-escaped."""
+    u = update.effective_user
+    if u is None:
+        return f"🆕 New user\nfirst topic: {html.escape(topic[:300])}"
+    uid = u.id
+    full = html.escape(u.full_name or u.first_name or "user")
+    first = html.escape(u.first_name or "—")
+    last = html.escape(u.last_name or "—")
+    esc_topic = html.escape(topic[:300])
+    if u.username:
+        un = html.escape(u.username)
+        uname = f'<a href="https://t.me/{un}">@{un}</a>'
+        via_username = f'  • via @{un}: https://t.me/{un}\n'
+    else:
+        uname = "— (no username)"
+        via_username = ""
+    lols = _LOLS_URL.format(id=uid)
+    return (
+        "🆕 <b>New user</b>\n"
+        f'👤 <a href="tg://user?id={uid}">{full}</a>\n'
+        f"   name: {first} · surname: {last}\n"
+        f"📛 username: {uname}\n"
+        f"🆔 id: <code>{uid}</code>\n"
+        f"💬 first topic: {esc_topic}\n"
+        "\n"
+        "🔗 <b>Open profile</b>\n"
+        f'  • Android/Desktop: <a href="tg://user?id={uid}">tg://user?id={uid}</a>\n'
+        f"  • iOS: <code>tg://openmessage?user_id={uid}</code>\n"
+        f"{via_username}"
+        f'🛡 lols check: <a href="{lols}">api.lols.bot/account?id={uid}</a>'
+    )
 
 
 def _user_label(update: Update) -> str:
@@ -1111,10 +1159,16 @@ async def run_pipeline_for_telegram(
         )
         # First-ever generation from this user → onboarding signal.
         if quota_count == 1:
-            await _log_to_group(
-                context, "new_users",
-                f"🆕 {_user_label(update)}\nfirst topic: {topic}",
+            mid = await _log_to_group(
+                context, "new_users", _new_user_card(update, topic),
+                parse_mode=ParseMode.HTML,
             )
+            if mid is None and _log_chat_id() is not None:
+                # HTML may have been rejected — never silently drop the event.
+                await _log_to_group(
+                    context, "new_users",
+                    f"🆕 {_user_label(update)}\nfirst topic: {topic}",
+                )
         # Just consumed their last free generation → the wall is now up.
         if quota_count is not None and quota_count == free_limit:
             await _log_to_group(
