@@ -18,6 +18,8 @@ transcripts.jsonl
 cards_corpus.jsonl
 card_outcomes.jsonl
 bootstrap_state.json
+quota_state.json
+log_topics.json
 .env
 
 # Editor / OS

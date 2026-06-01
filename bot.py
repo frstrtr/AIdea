@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import json
 import os
 import random
 import time
@@ -88,6 +89,7 @@ from usage import (
     summarize_for_chat,
     summarize_per_chat,
 )
+import quota
 
 
 def _admin_chat_ids() -> set[int]:
@@ -108,6 +110,118 @@ def _admin_chat_ids() -> set[int]:
 
 def _is_admin(chat_id: int) -> bool:
     return chat_id in _admin_chat_ids()
+
+
+# ---------------------------------------------------------------------------
+# Activity-feed log group
+#
+# A monitoring Telegram supergroup (forum) the bot mirrors activity into:
+# every idea generation (who / topic / mode / tokens / cost / quota), every
+# subscription inquiry from a walled user, and pipeline errors. Set its id in
+# AIDEA_LOG_CHAT_ID. The group must be a *forum* and the bot needs the
+# "Manage Topics" right so it can file each kind of event under its own topic;
+# if either is missing we silently fall back to the group's General topic.
+# ---------------------------------------------------------------------------
+
+_LOG_TOPICS_PATH = Path(__file__).parent / "log_topics.json"
+# logical channel -> (topic title, icon color). Colors must be one of the six
+# Telegram-permitted forum-topic colors.
+_LOG_TOPIC_DEFS: dict[str, tuple[str, int]] = {
+    "requests": ("📥 Requests", 0x6FB9F0),
+    "inquiries": ("💌 Subscription inquiries", 0xFFD67E),
+    "errors": ("⚠️ Errors", 0xFB6F5F),
+}
+# Serialize first-use topic creation so two concurrent events don't each
+# create a duplicate forum topic for the same channel.
+_LOG_TOPIC_LOCK = asyncio.Lock()
+
+
+def _log_chat_id() -> int | None:
+    raw = os.environ.get("AIDEA_LOG_CHAT_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _load_log_topics() -> dict:
+    try:
+        with _LOG_TOPICS_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_log_topics(data: dict) -> None:
+    try:
+        with _LOG_TOPICS_PATH.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        log.exception("could not persist log_topics.json")
+
+
+async def _log_thread_id(context: Any, key: str) -> int | None:
+    """message_thread_id for a logical log channel, creating the forum topic
+    on first use and caching it. None means 'post to the General topic'
+    (group isn't a forum, or the bot lacks Manage-Topics)."""
+    chat_id = _log_chat_id()
+    if chat_id is None:
+        return None
+    cache = _load_log_topics().get(str(chat_id), {})
+    if key in cache:
+        return cache[key]
+    async with _LOG_TOPIC_LOCK:
+        # Re-check under the lock — another coroutine may have just made it.
+        cache = _load_log_topics().get(str(chat_id), {})
+        if key in cache:
+            return cache[key]
+        title, color = _LOG_TOPIC_DEFS.get(key, (key.title(), 0x6FB9F0))
+        try:
+            topic = await context.bot.create_forum_topic(
+                chat_id=chat_id, name=title, icon_color=color,
+            )
+            tid = int(topic.message_thread_id)
+        except Exception:
+            # Not a forum / no rights — caller posts to General.
+            return None
+        allcache = _load_log_topics()
+        allcache.setdefault(str(chat_id), {})[key] = tid
+        _save_log_topics(allcache)
+        return tid
+
+
+async def _log_to_group(context: Any, key: str, text: str) -> None:
+    """Mirror an event into the monitoring group. Best-effort: any failure is
+    swallowed so logging can never break a user's pipeline. Plain text (no
+    Markdown) because user topics carry arbitrary characters."""
+    chat_id = _log_chat_id()
+    if chat_id is None:
+        return
+    try:
+        thread_id = await _log_thread_id(context, key)
+        kwargs: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+        await context.bot.send_message(**kwargs)
+    except Exception:
+        log.exception("log-group post failed (key=%s)", key)
+
+
+def _user_label(update: Update) -> str:
+    """Human-readable identifier for the log feed: 'Name @handle (id 123)'."""
+    u = update.effective_user
+    if u is None:
+        return f"chat {update.effective_chat.id}"
+    name = u.full_name or u.first_name or "user"
+    handle = f" @{u.username}" if u.username else ""
+    return f"{name}{handle} (id {u.id})"
 
 
 def _format_user_usage(chat_id: int) -> str:
@@ -239,6 +353,11 @@ class ChatState:
     # at the end of the pipeline. Cleared on submit or cancel.
     awaiting_brew_topic: bool = False
     pending_brew: bool = False
+    # Set once a user crosses their free-generation limit: their subsequent
+    # plain messages are captured as subscription inquiries (forwarded to the
+    # log group) rather than echoed back with a Yes/No card. Cleared when an
+    # admin resets their quota via /resetquota.
+    awaiting_inquiry: bool = False
 
 
 # chat_id -> ChatState
@@ -500,6 +619,28 @@ async def run_pipeline_for_telegram(
 ) -> None:
     chat_id = update.effective_chat.id
     state = state_for(chat_id)
+
+    # Free-tier quota. Counts interactive idea generations per Telegram
+    # *user* (not chat). Brews are free, admins are exempt — those bypass
+    # both the wall and the counter. Scheduled brews never reach this
+    # function (separate worker), so they're free automatically.
+    tg_user = update.effective_user
+    user_id = tg_user.id if tg_user is not None else chat_id
+    is_brew = bool(extra and extra.get("brew_render"))
+    # Interactive brews count too — they run the same (costlier) pipeline.
+    # Only admins are exempt. Scheduled brews never reach this function
+    # (separate worker), so they stay free automatically.
+    quota_exempt = _is_admin(user_id) or _is_admin(chat_id)
+    free_limit = quota.free_limit()
+    if not quota_exempt and quota.is_over(user_id, free_limit):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=_quota_prompt(_looks_russian(topic), free_limit),
+        )
+        # Capture whatever they send next as a subscription inquiry.
+        state.awaiting_inquiry = True
+        return
+
     if state.busy:
         elapsed = max(0.0, time.time() - (state.run_started_at or time.time()))
         remaining = max(1.0, (state.run_eta or 45.0) - elapsed)
@@ -519,6 +660,16 @@ async def run_pipeline_for_telegram(
     run_id = start_run(f"tg-{chat_id}")
     state.last_run_id = run_id  # /feedback targets this run by default
     set_source(f"telegram-{chat_id}")
+
+    # Count this generation against the user's free tier (brews / admins are
+    # exempt). Refunded in the error / cancel paths so a failed run is free.
+    quota_count: int | None = None
+    if not quota_exempt:
+        quota_count = quota.increment(
+            user_id,
+            name=(tg_user.full_name if tg_user else ""),
+            username=(tg_user.username if tg_user else ""),
+        )
     try:
         from rag import note_query, bootstrap_state, bootstrap_notice_text
         bs = note_query(f"telegram-{chat_id}")
@@ -835,13 +986,41 @@ async def run_pipeline_for_telegram(
             n_ideas=len(ideas), refined=bool(s.refine) and bool(ideas),
         )
 
+        # Activity feed → monitoring group.
+        if quota_count is not None:
+            quota_line = f"{quota_count}/{free_limit}" + (" · brew" if is_brew else "")
+        else:
+            quota_line = "exempt (admin)"
+        await _log_to_group(
+            context, "requests",
+            f"📥 {_user_label(update)}\n"
+            f"topic: {topic}\n"
+            f"mode: {mode} · quota: {quota_line}\n"
+            f"tokens: {fmt_tokens(run.get('input_tokens', 0))} in / "
+            f"{fmt_tokens(run.get('output_tokens', 0))} out · "
+            f"{fmt_usd(run.get('total_cost_usd', 0))} · "
+            f"{fmt_ms(run.get('duration_ms', 0))}",
+        )
+
     except asyncio.CancelledError:
         transcript_log("request_errored", error="cancelled")
+        # The run was aborted before delivering ideas — give the slot back.
+        if quota_count is not None:
+            quota.refund(user_id)
         return
     except Exception as e:
         log.exception("pipeline failed")
         transcript_log(
             "request_errored", error_type=type(e).__name__, error=str(e),
+        )
+        # Failed run shouldn't cost the user a free generation.
+        if quota_count is not None:
+            quota.refund(user_id)
+        await _log_to_group(
+            context, "errors",
+            f"⚠️ {_user_label(update)}\n"
+            f"topic: {topic}\nmode: {mode}\n"
+            f"error: {type(e).__name__}: {e}",
         )
         # Localized, friendly message. The raw SDK string ("Claude Code
         # returned an error result: success", "Command failed with exit
@@ -1225,6 +1404,70 @@ async def cmd_whoami(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_quota(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the caller their remaining free generations. Admins see the
+    whole roster (who's used what)."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    limit = quota.free_limit()
+    if _is_admin(user_id) or _is_admin(chat_id):
+        rows = quota._load()  # admin-only snapshot of the quota table
+        if not rows:
+            await update.message.reply_text("No users have generated yet.")
+            return
+        ordered = sorted(
+            rows.items(), key=lambda kv: int(kv[1].get("count", 0)), reverse=True,
+        )
+        lines = ["📊 *Free-tier usage* (limit "
+                 f"{limit}/user)\n"]
+        for uid, rec in ordered[:30]:
+            c = int(rec.get("count", 0))
+            who = rec.get("name") or rec.get("username") or uid
+            flag = " 🔒" if c >= limit else ""
+            lines.append(f"  {c}/{limit}{flag} — {who} (`{uid}`)")
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    used = quota.count(user_id)
+    left = max(0, limit - used)
+    await update.message.reply_text(
+        f"You've used {used}/{limit} free idea generations — {left} left."
+    )
+
+
+async def cmd_resetquota(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: reset a user's free-tier count after they subscribe.
+    Usage: /resetquota <user_id>  (the id shown in the inquiry log)."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    if not (_is_admin(user_id) or _is_admin(chat_id)):
+        await update.message.reply_text("Admins only.")
+        return
+    arg = _topic_from(update).strip().lstrip("@")
+    if not arg:
+        await update.message.reply_text("usage: /resetquota <user_id>")
+        return
+    try:
+        target = int(arg)
+    except ValueError:
+        await update.message.reply_text(
+            "user_id must be numeric — copy it from the inquiry log entry."
+        )
+        return
+    prior = quota.reset(target)
+    # Clear their inquiry-wait flag so the next message runs the pipeline
+    # again (only reachable for 1:1 chats where chat_id == user_id).
+    st = _STATES.get(target)
+    if st is not None:
+        st.awaiting_inquiry = False
+    await update.message.reply_text(
+        f"✅ Reset quota for `{target}` (was {prior}). "
+        f"They now have {quota.free_limit()} fresh generations.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 async def cmd_feedback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Explicit user-feedback signal targeting the last completed run.
 
@@ -1424,6 +1667,32 @@ _UNKNOWN_CMD_EN = (
 )
 
 
+def _quota_prompt(ru: bool, limit: int) -> str:
+    """Shown when a user hits their free-generation cap. Invites them to
+    leave a subscription inquiry right in the chat (captured + forwarded)."""
+    if ru:
+        return (
+            "✨ Понравились идеи?\n\n"
+            f"Вы использовали все {limit} бесплатных генераций идей.\n\n"
+            "Чтобы продолжить — оставьте заявку на подписку прямо здесь: "
+            "просто напишите сообщение (имя, контакт и что вам нужно), "
+            "и мы свяжемся с вами."
+        )
+    return (
+        "✨ Enjoying the ideas?\n\n"
+        f"You've used all {limit} free idea generations.\n\n"
+        "To keep going, leave your subscription inquiry right here — just "
+        "send a message (your name, contact, and what you need) and we'll "
+        "get back to you."
+    )
+
+
+_INQUIRY_ACK_RU = "✅ Спасибо! Заявка передана — мы свяжемся с вами."
+_INQUIRY_ACK_EN = (
+    "✅ Thanks! Your inquiry has been passed along — we'll be in touch."
+)
+
+
 def _effective_n_ideas(s: "ChatSettings") -> tuple[int, str]:
     """Return (n_ideas, why) — modes that force a specific count get a
     short suffix explaining why. Einstein/Futures are 4-pass by design;
@@ -1589,6 +1858,31 @@ async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     # users still want to sanity-check the topic before paying ~3 min.
     is_brew = state.awaiting_brew_topic
     state.awaiting_brew_topic = False
+
+    # Free-tier wall. A user past their limit can't start a new generation
+    # (interactive brews included); only admins are never walled. Their plain
+    # messages become subscription inquiries: forwarded to the log group,
+    # acknowledged here, never turned into a Yes/No card.
+    tg_user = update.effective_user
+    user_id = tg_user.id if tg_user is not None else update.effective_chat.id
+    walled = (
+        not (_is_admin(user_id) or _is_admin(update.effective_chat.id))
+        and quota.is_over(user_id)
+    )
+    if walled:
+        ru = _looks_russian(topic)
+        await _log_to_group(
+            ctx, "inquiries",
+            f"💌 {_user_label(update)}\n{topic}",
+        )
+        if not state.awaiting_inquiry:
+            state.awaiting_inquiry = True
+            await update.message.reply_text(_quota_prompt(ru, quota.free_limit()))
+        else:
+            await update.message.reply_text(
+                _INQUIRY_ACK_RU if ru else _INQUIRY_ACK_EN,
+            )
+        return
 
     if _looks_like_idle_chat(topic):
         if is_brew:
@@ -2474,6 +2768,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("usage", cmd_usage))
+    app.add_handler(CommandHandler("quota", cmd_quota))
+    app.add_handler(CommandHandler("resetquota", cmd_resetquota))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("corpus", cmd_corpus))
     app.add_handler(CommandHandler("feedback", cmd_feedback))
