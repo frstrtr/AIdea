@@ -22,6 +22,7 @@ quota_state.json
 log_topics.json
 log_backfill_done.json
 log_backfill_requests_done.json
+log_backfill_ideas_done.json
 .env
 
 # Editor / OS

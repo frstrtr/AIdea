@@ -131,6 +131,7 @@ _LOG_TOPICS_PATH = Path(__file__).parent / "log_topics.json"
 _LOG_TOPIC_DEFS: dict[str, tuple[str, int]] = {
     "new_users": ("🆕 New users", 0x6FB9F0),       # blue
     "generations": ("📥 Generations", 0x8EEE98),   # green
+    "ideas": ("💡 Ideas", 0xFFD67E),               # yellow — query→idea pairs
     "inquiries": ("💌 Subscription inquiries", 0xFFD67E),  # yellow
     "quota_hits": ("🚧 Quota hits", 0xCB86DB),     # purple
     "errors": ("⚠️ Errors", 0xFB6F5F),             # red
@@ -198,13 +199,17 @@ async def _log_thread_id(context: Any, key: str) -> int | None:
         return tid
 
 
-async def _log_to_group(context: Any, key: str, text: str) -> None:
+async def _log_to_group(
+    context: Any, key: str, text: str, reply_to: int | None = None,
+) -> int | None:
     """Mirror an event into the monitoring group. Best-effort: any failure is
     swallowed so logging can never break a user's pipeline. Plain text (no
-    Markdown) because user topics carry arbitrary characters."""
+    Markdown) because user topics carry arbitrary characters. Returns the sent
+    message_id (so callers can thread replies under it), or None on failure.
+    Pass reply_to to post as a reply to an earlier message in the topic."""
     chat_id = _log_chat_id()
     if chat_id is None:
-        return
+        return None
     try:
         thread_id = await _log_thread_id(context, key)
         kwargs: dict[str, Any] = {
@@ -214,9 +219,13 @@ async def _log_to_group(context: Any, key: str, text: str) -> None:
         }
         if thread_id is not None:
             kwargs["message_thread_id"] = thread_id
-        await context.bot.send_message(**kwargs)
+        if reply_to is not None:
+            kwargs["reply_to_message_id"] = reply_to
+        msg = await context.bot.send_message(**kwargs)
+        return msg.message_id if msg else None
     except Exception:
         log.exception("log-group post failed (key=%s)", key)
+        return None
 
 
 def _user_label(update: Update) -> str:
@@ -1062,6 +1071,29 @@ async def run_pipeline_for_telegram(
                 f"🚧 {_user_label(update)} used their last free generation "
                 f"({quota_count}/{free_limit}) — wall is now up.",
             )
+
+        # 💡 Ideas topic: the query, with the final idea threaded as a reply.
+        # Final = refined winner if refined, else the critic-winner, else the
+        # first idea. Long ideas split across reply messages.
+        final_idea = locals().get("refined")
+        if not final_idea:
+            if scored and ideas:
+                final_idea = ideas[winner["i"]]
+            elif ideas:
+                final_idea = ideas[0]
+        if final_idea:
+            qid = await _log_to_group(
+                context, "ideas",
+                f"📥 {_user_label(update)}\ntopic: {topic}\nmode: {mode}",
+            )
+            if qid:
+                chunks = split_for_telegram(final_idea)
+                for n, ch in enumerate(chunks):
+                    head = "💡 " if n == 0 else ""
+                    tail = f"  ({n + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+                    await _log_to_group(
+                        context, "ideas", head + ch + tail, reply_to=qid,
+                    )
 
     except asyncio.CancelledError:
         transcript_log("request_errored", error="cancelled")

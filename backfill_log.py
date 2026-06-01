@@ -43,6 +43,8 @@ QUOTA = HERE / "quota_state.json"
 LOG_TOPICS = HERE / "log_topics.json"
 MARKER = HERE / "log_backfill_done.json"
 REQ_MARKER = HERE / "log_backfill_requests_done.json"
+IDEAS_MARKER = HERE / "log_backfill_ideas_done.json"
+IDEAS_COLOR = 0xFFD67E  # must match bot._LOG_TOPIC_DEFS["ideas"]
 
 DAY_BULLET_CAP = 15  # max per-day generation bullets before "+N more"
 USERS_PER_MSG = 15   # new-user list chunk size
@@ -242,10 +244,18 @@ def compose_messages():
 # --------------------------------------------------------------------------
 # posting
 # --------------------------------------------------------------------------
-def send(token, chat_id, thread_id, text, dry, throttle):
+_DRY_ID = [1000]  # fake, increasing message_ids for --dry-run reply threading
+
+
+def send(token, chat_id, thread_id, text, dry, throttle, reply_to=None):
+    """Post one message. Returns the sent message_id (int) on success, or None
+    on failure. In dry-run returns a fake increasing id so reply threading can
+    still be exercised."""
     if dry:
-        print(f"\n──[ thread {thread_id} ]──\n{text}")
-        return True
+        tag = f" ↳reply {reply_to}" if reply_to else ""
+        print(f"\n──[ thread {thread_id}{tag} ]──\n{text}")
+        _DRY_ID[0] += 1
+        return _DRY_ID[0]
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -253,6 +263,8 @@ def send(token, chat_id, thread_id, text, dry, throttle):
     }
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
+    if reply_to is not None:
+        payload["reply_to_message_id"] = reply_to
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
         data=json.dumps(payload).encode(),
@@ -260,9 +272,10 @@ def send(token, chat_id, thread_id, text, dry, throttle):
     )
     for attempt in range(2):
         try:
-            with urllib.request.urlopen(req, timeout=30):
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode())
                 time.sleep(throttle)
-                return True
+                return body.get("result", {}).get("message_id")
         except urllib.error.HTTPError as e:
             body = e.read().decode()
             if e.code == 429:
@@ -274,11 +287,79 @@ def send(token, chat_id, thread_id, text, dry, throttle):
                 time.sleep(wait + 1)
                 continue
             print(f"  send failed {e.code}: {body}")
-            return False
+            return None
         except Exception as e:
             print(f"  send error: {e}")
-            return False
-    return False
+            return None
+    return None
+
+
+def create_topic(token, chat_id, name, color):
+    """Create a forum topic; return its message_thread_id (or None)."""
+    payload = {"chat_id": chat_id, "name": name, "icon_color": color}
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/createForumTopic",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode())
+            return body.get("result", {}).get("message_thread_id")
+    except Exception as e:
+        print(f"  create_topic failed: {e}")
+        return None
+
+
+def split_text(text, limit=4000):
+    """Split on paragraph / line boundaries under the Telegram cap."""
+    text = (text or "").strip()
+    if not text:
+        return ["(empty)"]
+    chunks, rem = [], text
+    while len(rem) > limit:
+        cut = max(rem[:limit].rfind("\n\n"), rem[:limit].rfind("\n"))
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(rem[:cut].rstrip())
+        rem = rem[cut:].lstrip()
+    if rem:
+        chunks.append(rem)
+    return chunks
+
+
+def idea_pairs():
+    """(query_text, final_idea_or_None) per telegram request, oldest first."""
+    tx = loadl(TRANSCRIPTS)
+    by_run = collections.defaultdict(list)
+    for r in tx:
+        by_run[r.get("run_id")].append(r)
+    started = sorted(
+        (r for r in tx if r.get("kind") == "request_started"
+         and str(r.get("source", "")).startswith("telegram")),
+        key=lambda r: r.get("ts", 0),
+    )
+    pairs = []
+    for r in started:
+        ev = by_run.get(r.get("run_id"), [])
+        refined = [x for x in ev if x.get("kind") == "refined" and x.get("text")]
+        ideas = [x for x in ev if x.get("kind") == "idea" and x.get("text")]
+        winners = [x for x in ev if x.get("kind") == "winner"]
+        final = None
+        if refined:
+            final = refined[-1]["text"]
+        elif winners and ideas:
+            i = winners[-1].get("i")
+            m = [x for x in ideas if x.get("i") == i]
+            final = (m[0] if m else ideas[0])["text"]
+        elif ideas:
+            final = ideas[0]["text"]
+        chat = r.get("chat_id") or str(r.get("source", "")).replace("telegram-", "")
+        topic = (r.get("topic") or "(no topic)")[:1500]
+        q = (f"📥 chat {chat} · {day(r.get('ts', 0))}\n"
+             f"topic: {topic}\nmode: {r.get('mode', 'default')}")
+        pairs.append((q, final))
+    return pairs
 
 
 # order topics are posted in
@@ -295,9 +376,15 @@ def main():
         help="post one message per individual request (faithful, untruncated) "
              "into 📥 Generations instead of the per-day digest",
     )
+    ap.add_argument(
+        "--ideas", action="store_true",
+        help="post each query into 💡 Ideas with its final idea threaded as a "
+             "reply",
+    )
     args = ap.parse_args()
 
-    marker = REQ_MARKER if args.all_requests else MARKER
+    marker = (IDEAS_MARKER if args.ideas
+              else REQ_MARKER if args.all_requests else MARKER)
     if marker.exists() and not args.force and not args.dry_run:
         print(f"Already done ({marker.read_text().strip()}). Use --force.")
         return 1
@@ -317,6 +404,60 @@ def main():
         print("log_topics.json has no thread-ids for this chat — start the "
               "bot once so it creates the topics, then re-run.")
         return 1
+
+    # --ideas: query → final-idea reply pairs into 💡 Ideas.
+    if args.ideas:
+        thread = topics.get("ideas")
+        if thread is None and not args.dry_run:
+            print("💡 Ideas topic missing — creating it…")
+            thread = create_topic(token, chat_id, "💡 Ideas", IDEAS_COLOR)
+            if thread is None:
+                print("could not create the Ideas topic — aborting.")
+                return 1
+            # persist so the live bot reuses the same thread
+            try:
+                allc = json.loads(LOG_TOPICS.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                allc = {}
+            allc.setdefault(str(chat_id), {})["ideas"] = thread
+            LOG_TOPICS.write_text(json.dumps(allc, ensure_ascii=False, indent=2))
+            print(f"created 💡 Ideas (thread {thread}), cached in log_topics.json")
+
+        pairs = idea_pairs()
+        throttle = args.throttle if args.throttle != 1.5 else 3.0
+        with_idea = sum(1 for _q, i in pairs if i)
+        print(f"{'DRY-RUN: ' if args.dry_run else ''}{len(pairs)} queries "
+              f"({with_idea} with a recoverable idea) → 💡 Ideas "
+              f"(throttle {throttle}s)\n")
+        posted = 0
+        for q, idea in pairs:
+            qid = send(token, chat_id, thread, q, args.dry_run, throttle)
+            posted += 1 if qid else 0
+            if not qid:
+                print(f"  query FAIL — {q.splitlines()[0][:50]}")
+                continue
+            if idea:
+                chunks = split_text(idea)
+                for n, ch in enumerate(chunks):
+                    head = "💡 " if n == 0 else ""
+                    tail = f"  ({n+1}/{len(chunks)})" if len(chunks) > 1 else ""
+                    if send(token, chat_id, thread, head + ch + tail,
+                            args.dry_run, throttle, reply_to=qid):
+                        posted += 1
+            else:
+                if send(token, chat_id, thread,
+                        "💡 (no idea recorded — run errored or was cancelled)",
+                        args.dry_run, throttle, reply_to=qid):
+                    posted += 1
+            print(f"  {'(dry)' if args.dry_run else 'ok'} — "
+                  f"{q.splitlines()[1][:50]}")
+        print(f"\n{'would post' if args.dry_run else 'posted'} {posted} messages")
+        if not args.dry_run and posted:
+            IDEAS_MARKER.write_text(
+                json.dumps({"done_ts": time.time(), "messages": posted}) + "\n"
+            )
+            print(f"wrote {IDEAS_MARKER.name}")
+        return 0
 
     # --all-requests: faithful per-request replay, all into 📥 Generations.
     if args.all_requests:
