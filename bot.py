@@ -260,6 +260,7 @@ async def daily_summary_callback(context: Any) -> None:
     users = len(table)
     walled = sum(1 for r in table.values() if int(r.get("count", 0)) >= limit)
     used = sum(int(r.get("count", 0)) for r in table.values())
+    subs = sum(1 for uid in table if quota.is_subscriber(uid))
     try:
         u = summarize(run_id=None)
         wk = u.get("last_7d", {}) or {}
@@ -272,11 +273,51 @@ async def daily_summary_callback(context: Any) -> None:
     await _log_to_group(
         context, "summary",
         "📊 Daily summary\n"
-        f"users seen: {users} · walled (≥{limit}): {walled}\n"
+        f"users seen: {users} · walled (≥{limit}): {walled} · "
+        f"subscribers 💎: {subs}\n"
         f"free generations used: {used}\n"
         f"last 7d: {fmt_tokens(out_7d)} out · {fmt_usd(cost_7d)}\n"
         f"all-time cost: {fmt_usd(cost_all)}",
     )
+
+
+def _sub_lapse_days() -> int:
+    try:
+        return max(1, int(os.environ.get("AIDEA_SUB_LAPSE_DAYS", "3") or 3))
+    except ValueError:
+        return 3
+
+
+async def subscription_lapse_callback(context: Any) -> None:
+    """Daily subscription watch → 💌 Inquiries topic. Flags subscribers whose
+    plan lapses within AIDEA_SUB_LAPSE_DAYS (default 3) and any that expired in
+    the last day, each with a ready-to-paste renew command. Stays silent when
+    there's nothing to report."""
+    if _log_chat_id() is None:
+        return
+    now = time.time()
+    window = _sub_lapse_days() * 86400.0
+    lapsing, expired = [], []
+    for uid, rec in quota.table().items():
+        try:
+            until = float(rec.get("subscribed_until") or 0)
+        except (TypeError, ValueError):
+            continue
+        if until <= 0:
+            continue
+        delta = until - now
+        who = rec.get("name") or rec.get("username") or uid
+        if 0 <= delta <= window:
+            lapsing.append((delta, f"• {who} ({uid}) — {delta / 86400:.1f}d "
+                                   f"left  →  /subscribe {uid} 30"))
+        elif -86400 <= delta < 0:  # expired within the last day
+            expired.append(f"• {who} ({uid}) — EXPIRED  →  /subscribe {uid} 30")
+    if not lapsing and not expired:
+        return
+    lines = ["⏳ Subscription watch"]
+    lines += [t for _, t in sorted(lapsing)]
+    lines += expired
+    await _log_to_group(context, "inquiries", "\n".join(lines))
 
 
 def _format_user_usage(chat_id: int) -> str:
@@ -2988,8 +3029,9 @@ def build_app() -> Application:
     except Exception:
         log.exception("brew queue init failed — scheduled brews disabled")
 
-    # Log group: pre-create the topics shortly after startup, and post a
-    # daily rollup at 18:00 UTC. Both no-op when AIDEA_LOG_CHAT_ID is unset.
+    # Log group: pre-create the topics shortly after startup, post a daily
+    # rollup at 18:00 UTC, and a subscription-lapse watch at 09:00 UTC. All
+    # no-op when AIDEA_LOG_CHAT_ID is unset.
     if app.job_queue is not None and _log_chat_id() is not None:
         app.job_queue.run_once(ensure_log_topics, when=5, name="ensure_log_topics")
         app.job_queue.run_daily(
@@ -2997,7 +3039,12 @@ def build_app() -> Application:
             time=dtime(hour=18, minute=0, tzinfo=timezone.utc),
             name="log_daily_summary",
         )
-        log.info("log-group topics + daily summary scheduled")
+        app.job_queue.run_daily(
+            subscription_lapse_callback,
+            time=dtime(hour=9, minute=0, tzinfo=timezone.utc),
+            name="subscription_lapse_watch",
+        )
+        log.info("log-group topics + daily summary + lapse watch scheduled")
     return app
 
 
