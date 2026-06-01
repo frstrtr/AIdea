@@ -1894,25 +1894,135 @@ def _try_parse_json_object(raw: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
-async def critic_score(topic: str, idea: str, model: str) -> dict:
-    """Return {feasibility, unexpectedness, topic_fit, notes} (ints clipped 0-100)."""
+CRITIC_AXES = ("feasibility", "unexpectedness", "uniqueness", "topic_fit")
+
+
+def _clip100(v: object) -> int:
+    try:
+        return max(0, min(100, int(float(v))))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _critic_single(topic: str, idea: str, model: str) -> dict:
+    """One-critic scoring — the original behaviour."""
     prompt = CRITIC_PROMPT_TEMPLATE.format(topic=topic.strip(), idea=idea.strip())
     raw = await _query_text(prompt, CRITIC_SYSTEM, model, kind="critic")
     obj = _try_parse_json_object(raw) or {}
-
-    def _clip(v: object) -> int:
-        try:
-            return max(0, min(100, int(float(v))))
-        except (TypeError, ValueError):
-            return 0
-
     return {
-        "feasibility": _clip(obj.get("feasibility")),
-        "unexpectedness": _clip(obj.get("unexpectedness")),
-        "uniqueness": _clip(obj.get("uniqueness")),
-        "topic_fit": _clip(obj.get("topic_fit")),
+        "feasibility": _clip100(obj.get("feasibility")),
+        "unexpectedness": _clip100(obj.get("unexpectedness")),
+        "uniqueness": _clip100(obj.get("uniqueness")),
+        "topic_fit": _clip100(obj.get("topic_fit")),
         "notes": str(obj.get("notes", "")).strip()[:500],
     }
+
+
+# ---------------------------------------------------------------------------
+# Diverse critic panel (Hong–Page diversity-prediction theorem).
+#
+# A crowd of deliberately DIFFERENT, individually-imperfect critics predicts
+# better than one strong critic, because their errors are uncorrelated and
+# cancel under averaging. Each lens below scores the same four axes but from a
+# distinct prior, so they err in different directions. The aggregate is the
+# plain per-axis mean (the form the theorem is stated over). Enable with
+# AIDEA_CRITIC_PANEL=1; critic_score() transparently dispatches here so every
+# call site (bot / web / CLI) gets it with no other change.
+# ---------------------------------------------------------------------------
+
+CRITIC_PANEL_SYSTEM = (
+    "You are {persona}, acting as one member of a panel of critics for an "
+    "applied-ideas synthesizer. Score a single idea against a user problem on "
+    "four axes (0-100) FROM YOUR PERSPECTIVE — lean into your bias; the panel "
+    "averages everyone out, so your job is to represent your view honestly, "
+    "not to be balanced. Output STRICT JSON only — one object, no code fences, "
+    "no preamble." + LANGUAGE_RULE
+)
+
+CRITIC_LENSES = (
+    {
+        "key": "feasibility_hawk",
+        "persona": "a skeptical operator who has watched a hundred clever "
+                   "ideas die in execution",
+        "directive": "Lens: FEASIBILITY HAWK. Weight execution risk, resource "
+                     "reality, and time-to-first-value above all. Distrust "
+                     "novelty for its own sake; reward what a small team could "
+                     "actually ship.",
+    },
+    {
+        "key": "novelty_seeker",
+        "persona": "a restless idea-hunter allergic to the obvious — and "
+                   "equally allergic to gimmicks dressed up as innovation",
+        "directive": "Lens: NOVELTY SEEKER. Reward genuine STRUCTURAL surprise "
+                     "— a mechanism transplanted from another domain that "
+                     "changes HOW the problem is solved. Do NOT reward "
+                     "superficial mash-ups (two existing products glued "
+                     "together), 'X-but-for-Y' clones, or clever-sounding "
+                     "gimmicks that add no real leverage — score those LOW on "
+                     "uniqueness. Originality must do work, not just sound new.",
+    },
+    {
+        "key": "domain_skeptic",
+        "persona": "a seasoned expert in the user's stated field who knows the "
+                   "prior art cold",
+        "directive": "Lens: DOMAIN SKEPTIC. Catch ideas that only LOOK new to "
+                     "outsiders. Penalize anything textbook in THIS field; "
+                     "reward true gaps an insider would respect.",
+    },
+    {
+        "key": "plain_user",
+        "persona": "the non-expert who would actually have to adopt this",
+        "directive": "Lens: PLAIN USER. Reward ideas you immediately understand "
+                     "and want. Penalize jargon, vagueness, and 'so what'. "
+                     "Clarity and pull matter as much as cleverness.",
+    },
+)
+
+
+async def critic_panel(topic: str, idea: str, model: str) -> dict:
+    """Score with the diverse panel and return the per-axis mean, in the same
+    shape as _critic_single plus a ``panel`` breakdown and ``n_critics``.
+    Falls back to a single critic if every lens fails to parse."""
+    topic_s, idea_s = topic.strip(), idea.strip()
+    base = CRITIC_PROMPT_TEMPLATE.format(topic=topic_s, idea=idea_s)
+
+    async def run_lens(lens: dict) -> tuple[str, dict, str]:
+        system = CRITIC_PANEL_SYSTEM.format(persona=lens["persona"])
+        prompt = lens["directive"] + "\n\n" + base
+        raw = await _query_text(prompt, system, model, kind="critic")
+        obj = _try_parse_json_object(raw) or {}
+        scores = {ax: _clip100(obj.get(ax)) for ax in CRITIC_AXES}
+        return lens["key"], scores, str(obj.get("notes", "")).strip()[:160]
+
+    results = await asyncio.gather(
+        *(run_lens(lens) for lens in CRITIC_LENSES), return_exceptions=True,
+    )
+    valid = [r for r in results if not isinstance(r, Exception)]
+    if not valid:
+        return await _critic_single(topic, idea, model)
+
+    panel = {key: scores for key, scores, _ in valid}
+    agg = {
+        ax: round(sum(s[ax] for s in panel.values()) / len(panel))
+        for ax in CRITIC_AXES
+    }
+    notes = " | ".join(f"{key}: {note}" for key, _, note in valid)[:500]
+    return {**agg, "notes": notes, "panel": panel, "n_critics": len(panel)}
+
+
+def _critic_panel_enabled() -> bool:
+    return os.environ.get("AIDEA_CRITIC_PANEL", "").strip() not in (
+        "", "0", "false", "False",
+    )
+
+
+async def critic_score(topic: str, idea: str, model: str) -> dict:
+    """Score one idea on the four axes. Dispatches to the diverse critic panel
+    when AIDEA_CRITIC_PANEL is set, else the single critic. Return shape is
+    identical for both so total_score() and all call sites are unchanged."""
+    if _critic_panel_enabled():
+        return await critic_panel(topic, idea, model)
+    return await _critic_single(topic, idea, model)
 
 
 # Maximum value of total_score. Used as the divisor for the RAG retrieval
