@@ -233,10 +233,10 @@ async def _log_to_group(
         return None
 
 
-# lols.bot spam/ban check — verified endpoint returns
-# {"ok":true,"user_id":N,"banned":bool}. Override host via env if it moves.
+# lols spam/ban check — the @oLolsBot deeplink: opens the bot and checks the
+# user-id passed via start. {id} is the Telegram user-id. Override via env.
 _LOLS_URL = os.environ.get(
-    "AIDEA_LOLS_URL", "https://api.lols.bot/account?id={id}",
+    "AIDEA_LOLS_URL", "https://t.me/oLolsBot?start={id}",
 )
 
 
@@ -272,7 +272,7 @@ def _new_user_card(update: Update, topic: str) -> str:
         f'  • Android/Desktop: <a href="tg://user?id={uid}">tg://user?id={uid}</a>\n'
         f"  • iOS: <code>tg://openmessage?user_id={uid}</code>\n"
         f"{via_username}"
-        f'🛡 lols check: <a href="{lols}">api.lols.bot/account?id={uid}</a>'
+        f'🛡 lols check: <a href="{lols}">@oLolsBot ?start={uid}</a>'
     )
 
 
