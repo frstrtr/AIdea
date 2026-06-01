@@ -2020,11 +2020,17 @@ def _critic_panel_enabled() -> bool:
     )
 
 
-async def critic_score(topic: str, idea: str, model: str) -> dict:
-    """Score one idea on the four axes. Dispatches to the diverse critic panel
-    when AIDEA_CRITIC_PANEL is set, else the single critic. Return shape is
-    identical for both so total_score() and all call sites are unchanged."""
-    if _critic_panel_enabled():
+async def critic_score(
+    topic: str, idea: str, model: str, *, force_panel: bool = False,
+) -> dict:
+    """Score one idea on the four axes. Uses the diverse critic panel when
+    EITHER the caller passes force_panel=True (the refine path — winner
+    selection is where the panel's accuracy actually changes the kept output)
+    OR the global AIDEA_CRITIC_PANEL flag is set (panel on every generation —
+    reserved as the future paid-tier feature). Otherwise the single critic.
+    Return shape is identical, so total_score() and all call sites are
+    unchanged."""
+    if force_panel or _critic_panel_enabled():
         return await critic_panel(topic, idea, model)
     return await _critic_single(topic, idea, model)
 
@@ -2954,7 +2960,10 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         print(f"\n=== Critic pass ({len(ideas)} ideas) ===")
         scored: list[dict] = []
         for i, idea in enumerate(ideas):
-            score = await critic_score(args.topic, idea, args.model)
+            # CLI only scores inside the refine branch → always panel.
+            score = await critic_score(
+                args.topic, idea, args.model, force_panel=True,
+            )
             score["i"] = i
             scored.append(score)
             transcript_log(

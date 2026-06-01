@@ -875,7 +875,9 @@ async def run_pipeline_for_telegram(
         if score_enabled and ideas:
             for i, idea in enumerate(ideas):
                 score = await run_with_progress(
-                    critic_score(topic, idea, s.model),
+                    # Panel on the refine path (better winner selection); single
+                    # critic otherwise. Global panel is the paid-tier flag.
+                    critic_score(topic, idea, s.model, force_panel=bool(s.refine)),
                     update=update, context=context, cancel=state.cancel,
                     headline=f"scoring idea {i + 1}",
                 )

@@ -242,10 +242,36 @@ a prompt.
 ### Refine + Evolve-Deck — Bayesian updating across runs
 
 The `refine` flag is **Bayesian model selection**: after generating N
-ideas, score each on three independent axes (feasibility / unexpectedness
-/ topic-fit), select the maximum posterior, then re-prompt at a tighter
-prior. This is the "sober validation" step the LSD literature names as
-the second half of psychedelic-assisted insight.
+ideas, score each on four independent axes (feasibility / unexpectedness
+/ uniqueness / topic-fit), select the maximum posterior, then re-prompt at
+a tighter prior. This is the "sober validation" step the LSD literature
+names as the second half of psychedelic-assisted insight.
+
+#### Critic panel — diverse scoring (Hong–Page)
+
+Winner selection can use a **panel of four deliberately-biased critics**
+instead of one — a feasibility hawk, a novelty seeker, a domain skeptic,
+and a plain user — scored concurrently and averaged. By the Hong–Page
+diversity-prediction theorem, a crowd of diverse, individually-imperfect
+estimators predicts better than one strong estimator, because their errors
+are uncorrelated and cancel. The novelty lens explicitly rejects gimmicks
+(superficial mash-ups, "X-but-for-Y" clones) so the panel rewards
+structural depth, not surface novelty. In A/B against an independent judge
+the panel agreed with the judge ~2× as often as the single critic and won
+every head-to-head disagreement (small sample; harness:
+`eval_critic_panel.py`).
+
+The panel costs 4 critic calls per idea, so it is **tiered**:
+
+- **Refine path — panel, for everyone.** Whenever `refine` is on, winner
+  selection uses the panel (that's the only time scoring changes the output
+  the user keeps). This is the default; no flag needed.
+- **`AIDEA_CRITIC_PANEL=1` — panel on *every* generation.** A global switch
+  that applies the panel to all scoring, not just refine. **Reserved as a
+  paid-tier feature** — leave it unset for free users; enable it for paying
+  customers (per-user gating to be wired into the subscription flow).
+
+Return shape is identical for single critic and panel, so it is a drop-in.
 
 The `evolve_deck` flag implements **memory consolidation** in the
 Loftus / reconstructive-memory sense (Elizabeth Loftus, decades of work

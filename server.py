@@ -442,7 +442,11 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
             score: dict | None = None
             try:
                 async for kind, payload in _watched(
-                    critic_score(req.topic, idea, req.model),
+                    # Panel on the refine path; single critic otherwise.
+                    # Global panel (every gen) is the paid-tier flag.
+                    critic_score(
+                        req.topic, idea, req.model, force_panel=bool(req.refine),
+                    ),
                     phase=f"critic-{i}",
                 ):
                     if kind == "progress":
