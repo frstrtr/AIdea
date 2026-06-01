@@ -137,7 +137,8 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--topics", type=int, default=2, help="how many default topics")
     ap.add_argument("--k", type=int, default=3, help="ideas generated per topic")
-    ap.add_argument("--entropy", default="high")
+    ap.add_argument("--entropy", default="wild",
+                    help="sane | wild | insane | crazy | mad, or a float 0..1")
     ap.add_argument("--model", default=os.environ.get("AIDEA_MODEL", "claude-opus-4-7"))
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
