@@ -31,6 +31,7 @@ import json
 import os
 import random
 import time
+from datetime import time as dtime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -125,11 +126,15 @@ def _is_admin(chat_id: int) -> bool:
 
 _LOG_TOPICS_PATH = Path(__file__).parent / "log_topics.json"
 # logical channel -> (topic title, icon color). Colors must be one of the six
-# Telegram-permitted forum-topic colors.
+# Telegram-permitted forum-topic colors. Insertion order is the order topics
+# are pre-created at startup, so the group reads top-to-bottom as listed.
 _LOG_TOPIC_DEFS: dict[str, tuple[str, int]] = {
-    "requests": ("📥 Requests", 0x6FB9F0),
-    "inquiries": ("💌 Subscription inquiries", 0xFFD67E),
-    "errors": ("⚠️ Errors", 0xFB6F5F),
+    "new_users": ("🆕 New users", 0x6FB9F0),       # blue
+    "generations": ("📥 Generations", 0x8EEE98),   # green
+    "inquiries": ("💌 Subscription inquiries", 0xFFD67E),  # yellow
+    "quota_hits": ("🚧 Quota hits", 0xCB86DB),     # purple
+    "errors": ("⚠️ Errors", 0xFB6F5F),             # red
+    "summary": ("📊 Daily summary", 0xFF93B2),     # rose
 }
 # Serialize first-use topic creation so two concurrent events don't each
 # create a duplicate forum topic for the same channel.
@@ -222,6 +227,47 @@ def _user_label(update: Update) -> str:
     name = u.full_name or u.first_name or "user"
     handle = f" @{u.username}" if u.username else ""
     return f"{name}{handle} (id {u.id})"
+
+
+async def ensure_log_topics(context: Any) -> None:
+    """Pre-create every log topic at startup, in _LOG_TOPIC_DEFS order, so the
+    monitoring group is laid out top-to-bottom as designed instead of in
+    whatever order events happen to fire. No-op once they're all cached, and
+    silently skipped if AIDEA_LOG_CHAT_ID is unset / the group isn't a forum."""
+    if _log_chat_id() is None:
+        return
+    for key in _LOG_TOPIC_DEFS:
+        await _log_thread_id(context, key)
+
+
+async def daily_summary_callback(context: Any) -> None:
+    """Once-a-day rollup posted to the 📊 Daily summary topic: how many users
+    we've seen, how many are walled, total free generations consumed, plus
+    token/cost figures from usage.jsonl."""
+    if _log_chat_id() is None:
+        return
+    limit = quota.free_limit()
+    table = quota.table()
+    users = len(table)
+    walled = sum(1 for r in table.values() if int(r.get("count", 0)) >= limit)
+    used = sum(int(r.get("count", 0)) for r in table.values())
+    try:
+        u = summarize(run_id=None)
+        wk = u.get("last_7d", {}) or {}
+        tot = u.get("total", {}) or {}
+        cost_7d = wk.get("total_cost_usd", 0)
+        out_7d = wk.get("output_tokens", 0)
+        cost_all = tot.get("total_cost_usd", 0)
+    except Exception:
+        cost_7d = out_7d = cost_all = 0
+    await _log_to_group(
+        context, "summary",
+        "📊 Daily summary\n"
+        f"users seen: {users} · walled (≥{limit}): {walled}\n"
+        f"free generations used: {used}\n"
+        f"last 7d: {fmt_tokens(out_7d)} out · {fmt_usd(cost_7d)}\n"
+        f"all-time cost: {fmt_usd(cost_all)}",
+    )
 
 
 def _format_user_usage(chat_id: int) -> str:
@@ -986,13 +1032,15 @@ async def run_pipeline_for_telegram(
             n_ideas=len(ideas), refined=bool(s.refine) and bool(ideas),
         )
 
-        # Activity feed → monitoring group.
+        # Activity feed → monitoring group. Emitted only on success (the
+        # error/cancel paths refund the slot, so new-user / quota-hit signals
+        # below would be wrong if fired earlier).
         if quota_count is not None:
             quota_line = f"{quota_count}/{free_limit}" + (" · brew" if is_brew else "")
         else:
             quota_line = "exempt (admin)"
         await _log_to_group(
-            context, "requests",
+            context, "generations",
             f"📥 {_user_label(update)}\n"
             f"topic: {topic}\n"
             f"mode: {mode} · quota: {quota_line}\n"
@@ -1001,6 +1049,19 @@ async def run_pipeline_for_telegram(
             f"{fmt_usd(run.get('total_cost_usd', 0))} · "
             f"{fmt_ms(run.get('duration_ms', 0))}",
         )
+        # First-ever generation from this user → onboarding signal.
+        if quota_count == 1:
+            await _log_to_group(
+                context, "new_users",
+                f"🆕 {_user_label(update)}\nfirst topic: {topic}",
+            )
+        # Just consumed their last free generation → the wall is now up.
+        if quota_count is not None and quota_count == free_limit:
+            await _log_to_group(
+                context, "quota_hits",
+                f"🚧 {_user_label(update)} used their last free generation "
+                f"({quota_count}/{free_limit}) — wall is now up.",
+            )
 
     except asyncio.CancelledError:
         transcript_log("request_errored", error="cancelled")
@@ -1411,7 +1472,7 @@ async def cmd_quota(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id if update.effective_user else chat_id
     limit = quota.free_limit()
     if _is_admin(user_id) or _is_admin(chat_id):
-        rows = quota._load()  # admin-only snapshot of the quota table
+        rows = quota.table()  # admin-only snapshot of the quota table
         if not rows:
             await update.message.reply_text("No users have generated yet.")
             return
@@ -2804,6 +2865,17 @@ def build_app() -> Application:
             log.warning("PTB JobQueue unavailable — scheduled brews disabled")
     except Exception:
         log.exception("brew queue init failed — scheduled brews disabled")
+
+    # Log group: pre-create the topics shortly after startup, and post a
+    # daily rollup at 18:00 UTC. Both no-op when AIDEA_LOG_CHAT_ID is unset.
+    if app.job_queue is not None and _log_chat_id() is not None:
+        app.job_queue.run_once(ensure_log_topics, when=5, name="ensure_log_topics")
+        app.job_queue.run_daily(
+            daily_summary_callback,
+            time=dtime(hour=18, minute=0, tzinfo=timezone.utc),
+            name="log_daily_summary",
+        )
+        log.info("log-group topics + daily summary scheduled")
     return app
 
 

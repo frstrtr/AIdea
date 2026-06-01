@@ -49,6 +49,13 @@ def _save(data: dict) -> None:
     tmp.replace(_PATH)
 
 
+def table() -> dict:
+    """Snapshot of the whole quota table (str(user_id) -> record). For admin
+    views / summaries — read-only, callers must not mutate the live file."""
+    with _LOCK:
+        return _load()
+
+
 def count(user_id: int | str) -> int:
     with _LOCK:
         rec = _load().get(str(user_id))
