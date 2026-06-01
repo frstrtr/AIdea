@@ -42,6 +42,7 @@ USAGE = HERE / "usage.jsonl"
 QUOTA = HERE / "quota_state.json"
 LOG_TOPICS = HERE / "log_topics.json"
 MARKER = HERE / "log_backfill_done.json"
+REQ_MARKER = HERE / "log_backfill_requests_done.json"
 
 DAY_BULLET_CAP = 15  # max per-day generation bullets before "+N more"
 USERS_PER_MSG = 15   # new-user list chunk size
@@ -128,6 +129,23 @@ def build():
         by_day[day(g["ts"])].append(g)
 
     return gens, users, by_day
+
+
+def compose_request_messages() -> list[str]:
+    """One message per individual telegram request (faithful replay, nothing
+    truncated), oldest→newest — for --all-requests."""
+    gens, _users, _by_day = build()
+    out = []
+    for g in gens:
+        topic = (g["topic"] or "(no topic)")[:1500]
+        out.append(
+            f"⏪ chat {g['chat']}\n"
+            f"topic: {topic}\n"
+            f"mode: {g['mode']} · {day(g['ts'])}\n"
+            f"tokens: {fmt_tokens(g['in'])} in / {fmt_tokens(g['out'])} out · "
+            f"{fmt_usd(g['usd'])}"
+        )
+    return out
 
 
 def corpus_snapshot() -> str:
@@ -272,11 +290,16 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--throttle", type=float, default=1.5)
+    ap.add_argument(
+        "--all-requests", action="store_true",
+        help="post one message per individual request (faithful, untruncated) "
+             "into 📥 Generations instead of the per-day digest",
+    )
     args = ap.parse_args()
 
-    if MARKER.exists() and not args.force and not args.dry_run:
-        print(f"Backfill already done ({MARKER.read_text().strip()}). "
-              "Use --force to re-run.")
+    marker = REQ_MARKER if args.all_requests else MARKER
+    if marker.exists() and not args.force and not args.dry_run:
+        print(f"Already done ({marker.read_text().strip()}). Use --force.")
         return 1
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -294,6 +317,28 @@ def main():
         print("log_topics.json has no thread-ids for this chat — start the "
               "bot once so it creates the topics, then re-run.")
         return 1
+
+    # --all-requests: faithful per-request replay, all into 📥 Generations.
+    if args.all_requests:
+        reqs = compose_request_messages()
+        # default to a gentler throttle for the bigger burst unless overridden
+        throttle = args.throttle if args.throttle != 1.5 else 3.0
+        print(f"{'DRY-RUN: ' if args.dry_run else ''}posting {len(reqs)} "
+              f"per-request messages → generations (throttle {throttle}s)\n")
+        sent = 0
+        thread = topics.get("generations")
+        for text in reqs:
+            ok = send(token, chat_id, thread, text, args.dry_run, throttle)
+            sent += 1 if ok else 0
+            print(f"  {'(dry)' if args.dry_run else ('ok' if ok else 'FAIL')}"
+                  f" — {text.splitlines()[1][:60]}")
+        print(f"\n{'would post' if args.dry_run else 'posted'} {sent}/{len(reqs)}")
+        if not args.dry_run and sent:
+            REQ_MARKER.write_text(
+                json.dumps({"done_ts": time.time(), "messages": sent}) + "\n"
+            )
+            print(f"wrote {REQ_MARKER.name}")
+        return 0
 
     msgs = compose_messages()
     total = sum(len(v) for v in msgs.values())
