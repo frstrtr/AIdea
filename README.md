@@ -266,10 +266,14 @@ The panel costs 4 critic calls per idea, so it is **tiered**:
 - **Refine path — panel, for everyone.** Whenever `refine` is on, winner
   selection uses the panel (that's the only time scoring changes the output
   the user keeps). This is the default; no flag needed.
-- **`AIDEA_CRITIC_PANEL=1` — panel on *every* generation.** A global switch
-  that applies the panel to all scoring, not just refine. **Reserved as a
-  paid-tier feature** — leave it unset for free users; enable it for paying
-  customers (per-user gating to be wired into the subscription flow).
+- **Paid subscribers — panel on *every* generation, per user.** A subscriber
+  (Telegram) bypasses the free-tier wall *and* gets the panel on all scoring,
+  not just refine. Admins activate it with `/subscribe <user_id> [days]` after
+  payment clears (stacks on re-run; `/unsubscribe` revokes); state is a
+  `subscribed_until` timestamp in `quota_state.json`. This is the paid tier.
+- **`AIDEA_CRITIC_PANEL=1` — panel for *everyone*, every generation.** The
+  same behaviour as a global switch (e.g. an all-paid deployment); leave it
+  unset when you want the free/paid split above.
 
 Return shape is identical for single critic and panel, so it is a drop-in.
 

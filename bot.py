@@ -683,9 +683,11 @@ async def run_pipeline_for_telegram(
     user_id = tg_user.id if tg_user is not None else chat_id
     is_brew = bool(extra and extra.get("brew_render"))
     # Interactive brews count too — they run the same (costlier) pipeline.
-    # Only admins are exempt. Scheduled brews never reach this function
-    # (separate worker), so they stay free automatically.
-    quota_exempt = _is_admin(user_id) or _is_admin(chat_id)
+    # Admins and paid subscribers are exempt from the free-tier wall.
+    # Scheduled brews never reach this function (separate worker), so they
+    # stay free automatically.
+    is_sub = quota.is_subscriber(user_id)
+    quota_exempt = _is_admin(user_id) or _is_admin(chat_id) or is_sub
     free_limit = quota.free_limit()
     if not quota_exempt and quota.is_over(user_id, free_limit):
         await context.bot.send_message(
@@ -875,9 +877,13 @@ async def run_pipeline_for_telegram(
         if score_enabled and ideas:
             for i, idea in enumerate(ideas):
                 score = await run_with_progress(
-                    # Panel on the refine path (better winner selection); single
-                    # critic otherwise. Global panel is the paid-tier flag.
-                    critic_score(topic, idea, s.model, force_panel=bool(s.refine)),
+                    # Panel for the refine path (better winner selection) and
+                    # for paid subscribers on every generation; single critic
+                    # otherwise. Global AIDEA_CRITIC_PANEL still forces it on.
+                    critic_score(
+                        topic, idea, s.model,
+                        force_panel=bool(s.refine) or is_sub,
+                    ),
                     update=update, context=context, cancel=state.cancel,
                     headline=f"scoring idea {i + 1}",
                 )
@@ -1048,6 +1054,8 @@ async def run_pipeline_for_telegram(
         # below would be wrong if fired earlier).
         if quota_count is not None:
             quota_line = f"{quota_count}/{free_limit}" + (" · brew" if is_brew else "")
+        elif is_sub:
+            quota_line = "subscriber 💎"
         else:
             quota_line = "exempt (admin)"
         await _log_to_group(
@@ -1513,15 +1521,27 @@ async def cmd_quota(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ordered = sorted(
             rows.items(), key=lambda kv: int(kv[1].get("count", 0)), reverse=True,
         )
-        lines = ["📊 *Free-tier usage* (limit "
-                 f"{limit}/user)\n"]
+        subs = sum(1 for uid in rows if quota.is_subscriber(uid))
+        lines = [f"📊 *Free-tier usage* (limit {limit}/user · "
+                 f"{subs} subscriber(s))\n"]
         for uid, rec in ordered[:30]:
             c = int(rec.get("count", 0))
             who = rec.get("name") or rec.get("username") or uid
-            flag = " 🔒" if c >= limit else ""
-            lines.append(f"  {c}/{limit}{flag} — {who} (`{uid}`)")
+            if quota.is_subscriber(uid):
+                tag = " 💎"
+            elif c >= limit:
+                tag = " 🔒"
+            else:
+                tag = ""
+            lines.append(f"  {c}/{limit}{tag} — {who} (`{uid}`)")
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if quota.is_subscriber(user_id):
+        await update.message.reply_text(
+            "💎 You're a subscriber — unlimited generations, with the diverse "
+            "critic panel on every one. Thank you!"
         )
         return
     used = quota.count(user_id)
@@ -1560,6 +1580,71 @@ async def cmd_resetquota(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> Non
         f"✅ Reset quota for `{target}` (was {prior}). "
         f"They now have {quota.free_limit()} fresh generations.",
         parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+def _admin_target(update: Update) -> tuple[bool, int | None, str]:
+    """Shared guard for admin user-id commands. Returns
+    (is_admin, target_user_id_or_None, raw_args)."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    if not (_is_admin(user_id) or _is_admin(chat_id)):
+        return False, None, ""
+    parts = _topic_from(update).split()
+    if not parts:
+        return True, None, ""
+    try:
+        return True, int(parts[0].lstrip("@")), " ".join(parts[1:])
+    except ValueError:
+        return True, None, " ".join(parts[1:])
+
+
+async def cmd_subscribe(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: activate a paid subscription (the loop-closer after payment).
+    Usage: /subscribe <user_id> [days]   (days default 30, stacks if re-run).
+    A subscriber bypasses the free-tier wall and gets the critic panel on
+    every generation."""
+    ok, target, rest = _admin_target(update)
+    if not ok:
+        await update.message.reply_text("Admins only.")
+        return
+    if target is None:
+        await update.message.reply_text("usage: /subscribe <user_id> [days]")
+        return
+    days = 30
+    if rest.strip():
+        try:
+            days = max(1, int(rest.split()[0]))
+        except ValueError:
+            pass
+    until = quota.set_subscriber(target, days=days)
+    st = _STATES.get(target)
+    if st is not None:
+        st.awaiting_inquiry = False  # let them generate immediately
+    when = time.strftime("%Y-%m-%d", time.gmtime(until))
+    await update.message.reply_text(
+        f"💎 `{target}` is now a subscriber for {days} day(s) — until {when}. "
+        "Unlimited generations + critic panel on every run.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await _log_to_group(
+        _ctx, "inquiries",
+        f"💎 subscription activated: user {target} · {days}d · until {when}",
+    )
+
+
+async def cmd_unsubscribe(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: revoke a subscription immediately. Usage: /unsubscribe <user_id>."""
+    ok, target, _rest = _admin_target(update)
+    if not ok:
+        await update.message.reply_text("Admins only.")
+        return
+    if target is None:
+        await update.message.reply_text("usage: /unsubscribe <user_id>")
+        return
+    quota.clear_subscriber(target)
+    await update.message.reply_text(
+        f"Revoked subscription for `{target}`.", parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -1962,6 +2047,7 @@ async def on_plain_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     user_id = tg_user.id if tg_user is not None else update.effective_chat.id
     walled = (
         not (_is_admin(user_id) or _is_admin(update.effective_chat.id))
+        and not quota.is_subscriber(user_id)
         and quota.is_over(user_id)
     )
     if walled:
@@ -2865,6 +2951,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("quota", cmd_quota))
     app.add_handler(CommandHandler("resetquota", cmd_resetquota))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("corpus", cmd_corpus))
     app.add_handler(CommandHandler("feedback", cmd_feedback))

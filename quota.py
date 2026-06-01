@@ -123,3 +123,61 @@ def reset(user_id: int | str) -> int:
             data[key]["reset_ts"] = time.time()
             _save(data)
     return prior
+
+
+# ---------------------------------------------------------------------------
+# Paid subscribers. A subscriber bypasses the free-tier wall and gets the
+# diverse critic panel on every generation (the paid-tier feature). Stored as
+# a per-user `subscribed_until` unix timestamp in the same quota file; absent
+# or in the past means not subscribed. This is the activation hook for the
+# subscription flow — call set_subscriber once payment clears.
+# ---------------------------------------------------------------------------
+
+
+def is_subscriber(user_id: int | str, *, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    with _LOCK:
+        rec = _load().get(str(user_id))
+    until = (rec or {}).get("subscribed_until")
+    try:
+        return float(until) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def subscribed_until(user_id: int | str) -> float | None:
+    with _LOCK:
+        rec = _load().get(str(user_id))
+    val = (rec or {}).get("subscribed_until")
+    try:
+        return float(val) if val else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_subscriber(user_id: int | str, *, days: int = 30,
+                   now: float | None = None) -> float:
+    """Grant (or extend) a subscription for `days`. Extends from the later of
+    now or the current expiry, so re-granting stacks. Returns the new expiry."""
+    now = time.time() if now is None else now
+    key = str(user_id)
+    with _LOCK:
+        data = _load()
+        rec = data.get(key) or {"count": 0, "first_ts": now}
+        base = max(now, float(rec.get("subscribed_until") or 0))
+        rec["subscribed_until"] = base + days * 86400
+        rec.setdefault("first_ts", now)
+        data[key] = rec
+        _save(data)
+        return rec["subscribed_until"]
+
+
+def clear_subscriber(user_id: int | str) -> None:
+    """Revoke a subscription immediately."""
+    key = str(user_id)
+    with _LOCK:
+        data = _load()
+        rec = data.get(key)
+        if rec and rec.get("subscribed_until"):
+            rec["subscribed_until"] = 0
+            _save(data)
