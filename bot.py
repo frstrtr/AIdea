@@ -81,8 +81,10 @@ from aidea import (
     parse_entropy,
     refine_idea,
     sample_cards,
+    set_level,
     synthesize,
     total_score,
+    LEVEL_NAMES,
 )
 from transcripts import log_event as transcript_log, set_source
 from usage import (
@@ -468,6 +470,8 @@ class ChatSettings:
     n_concepts: int = 3
     n_ideas: int = 3
     model: str = "claude-opus-4-7"
+    # Audience register for the final idea: dummies | normal | expert.
+    level: str = "normal"
     refine: bool = False
     evolve_deck: bool = False
     seed: int | None = None
@@ -829,6 +833,7 @@ async def run_pipeline_for_telegram(
     s = state.settings
     spread, level = parse_entropy(s.entropy)
     depth = CARD_DEPTH_BY_NAME[s.card_depth]
+    set_level(s.level)  # audience register for the final idea (per-run)
 
     transcript_log(
         "request_started",
@@ -1509,6 +1514,8 @@ MODES_TEXT = (
     "  card_depth=shallow|medium|deep|max   per-card detail\n"
     "  n_concepts=K                         cards drawn per idea\n"
     "  n_ideas=N                            ideas per run\n"
+    "  level=dummies|normal|expert          final-idea wording (default\n"
+    "                                       normal; expert = max detail+terms)\n"
     "  theme_entropy=X                      0..1, how distant the auto-\n"
     "                                       generated donor domains are\n"
     "  themes=A,B,C                         override theme auto-pick\n"
@@ -1537,6 +1544,7 @@ async def cmd_settings(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"card_depth={s.card_depth}\n"
         f"n_concepts={s.n_concepts}\n"
         f"n_ideas={s.n_ideas}\n"
+        f"level={s.level}  (dummies | normal | expert)\n"
         f"refine={s.refine}\n"
         f"evolve_deck={s.evolve_deck}\n"
         f"seed={s.seed}\n"
@@ -1547,7 +1555,7 @@ async def cmd_settings(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 SETTABLE = {
     "entropy", "cards", "card_depth", "n_concepts", "n_ideas",
-    "refine", "evolve_deck", "seed", "model",
+    "refine", "evolve_deck", "seed", "model", "level",
 }
 
 
@@ -1571,6 +1579,14 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             s.seed = int(val) if val.lower() not in ("", "none", "null") else None
         elif key in ("refine", "evolve_deck"):
             setattr(s, key, val.lower() in ("1", "true", "yes", "on"))
+        elif key == "level":
+            lv = val.strip().lower()
+            if lv not in LEVEL_NAMES:
+                await update.message.reply_text(
+                    f"level must be one of: {', '.join(LEVEL_NAMES)}"
+                )
+                return
+            s.level = lv
         else:
             setattr(s, key, val)
     except ValueError as e:

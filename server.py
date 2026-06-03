@@ -76,6 +76,7 @@ class GenerateRequest(BaseModel):
     n_ideas: int = Field(3, ge=1, le=5)
     seed: int | None = None
     model: str = "claude-opus-4-7"
+    level: str = "normal"  # final-idea register: dummies | normal | expert
     regen_deck: bool = False
     bank: str | None = None  # path to static JSON bank; bypasses deck-gen
     bank_data: dict[str, list[str]] | None = None  # inline static bank
@@ -139,6 +140,8 @@ async def event_stream(req: GenerateRequest) -> AsyncIterator[bytes]:
     from transcripts import set_source, log_event as transcript_log
     run_id = start_run("web")
     set_source("web")
+    from aidea import set_level
+    set_level(req.level)  # audience register for the final idea (per-run)
     try:
         from rag import note_query
         note_query("web")
@@ -1106,6 +1109,13 @@ INDEX_HTML = r"""<!doctype html>
         <option value="medium" selected>medium (~60 tok)</option>
         <option value="deep">deep (~200 tok)</option>
         <option value="max">max (~500 tok)</option>
+      </select>
+    </label>
+    <label>Response level
+      <select name="level">
+        <option value="dummies">dummies (plainest)</option>
+        <option value="normal" selected>normal (default)</option>
+        <option value="expert">expert (max detail + terms)</option>
       </select>
     </label>
   </div>

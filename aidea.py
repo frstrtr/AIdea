@@ -1622,6 +1622,56 @@ SYNTHESIZER_SYSTEM = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Audience level — selectable register for the final idea. Injected into the
+# synthesizer / refiner system prompt (no extra LLM calls). Set once per run
+# via set_level(); reads through a ContextVar so it propagates across the
+# awaits within one pipeline task without threading a param through every
+# synthesize() call. Default 'normal'.
+# ---------------------------------------------------------------------------
+
+LEVEL_NAMES = ("dummies", "normal", "expert")
+
+LEVEL_DIRECTIVES: dict[str, str] = {
+    "dummies": (
+        "\n\nAUDIENCE LEVEL — DUMMIES: Write the ENTIRE response in the "
+        "simplest everyday language. Short sentences. No jargon, no technical "
+        "or field-specific terms. Explain it as if to a smart 12-year-old or a "
+        "complete newcomer; if a specialised idea is unavoidable, immediately "
+        "restate it in plain words."
+    ),
+    "normal": (
+        "\n\nAUDIENCE LEVEL — NORMAL: Use clear, general language a "
+        "non-specialist understands. Avoid undefined jargon and field-specific "
+        "terms; if one is unavoidable, gloss it briefly in passing."
+    ),
+    "expert": (
+        "\n\nAUDIENCE LEVEL — EXPERT: Maximum depth and precision. Use the "
+        "field's exact terminology, name specific methods, tools, metrics and "
+        "prior art, and include the technical detail a domain expert expects. "
+        "Assume full domain fluency — do not over-explain the basics."
+    ),
+}
+
+_level_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "aidea_level", default="normal",
+)
+
+
+def set_level(level: str | None) -> str:
+    """Set the audience level for the current pipeline run. Unknown/empty
+    falls back to 'normal'. Returns the resolved level."""
+    lvl = (level or "normal").strip().lower()
+    if lvl not in LEVEL_DIRECTIVES:
+        lvl = "normal"
+    _level_var.set(lvl)
+    return lvl
+
+
+def _level_directive() -> str:
+    return LEVEL_DIRECTIVES.get(_level_var.get(), "")
+
+
 async def _run_query_once(
     prompt: str,
     system: str,
@@ -1824,7 +1874,7 @@ async def synthesize(
 ) -> str:
     """Run the inference engine via the agent SDK (inherits CLI auth)."""
     return await _run_query(
-        prompt, SYNTHESIZER_SYSTEM, model,
+        prompt, SYNTHESIZER_SYSTEM + _level_directive(), model,
         kind="synth", stream_to_stdout=stream_to_stdout,
     )
 
@@ -2222,7 +2272,9 @@ async def refine_idea(
         idea=idea.strip(),
         notes=notes.strip() or "no specific critique provided",
     )
-    return await _query_text(prompt, SYNTHESIZER_SYSTEM, model, kind="refine")
+    return await _query_text(
+        prompt, SYNTHESIZER_SYSTEM + _level_directive(), model, kind="refine",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2428,6 +2480,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Random seed (for reproducible concept sampling).",
     )
     p.add_argument(
+        "--level",
+        choices=list(LEVEL_NAMES),
+        default="normal",
+        help="Audience register for the final idea: dummies (plainest), "
+             "normal (default), or expert (max detail + field terms).",
+    )
+    p.add_argument(
         "--bank",
         type=str,
         default=None,
@@ -2621,6 +2680,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     source = os.environ.get("AIDEA_SOURCE", "").strip() or "cli"
     run_id = start_run(source)
     set_source(source)
+    set_level(getattr(args, "level", "normal"))  # final-idea register
     if not args.quiet:
         print(f"[usage] run_id={run_id}", file=sys.stderr)
     spread, level = parse_entropy(args.entropy)
