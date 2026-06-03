@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 # Load .env from the project directory before anything else reads env vars.
 load_dotenv(Path(__file__).parent / ".env")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -740,6 +740,24 @@ async def generate(req: GenerateRequest):
     if req.cards < req.n_concepts:
         raise HTTPException(400, "cards must be >= n_concepts")
     return StreamingResponse(event_stream(req), media_type="text/event-stream")
+
+
+@app.post("/api/pay/porto/webhook")
+async def porto_webhook(request: Request):
+    """PortoAPI payment webhook. Verifies the HMAC over the RAW body, then
+    activates/extends the subscriber. Returns 2xx only after the result is
+    durably persisted (handle_event writes before returning). Idempotent."""
+    import porto
+    if not porto.webhook_configured():
+        raise HTTPException(503, "payments not configured")
+    raw = await request.body()
+    if not porto.verify(raw, request.headers.get("X-Porto-Signature", "")):
+        raise HTTPException(401, "bad signature")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid json")
+    return await asyncio.to_thread(porto.handle_event, payload)
 
 
 @app.get("/", response_class=HTMLResponse)

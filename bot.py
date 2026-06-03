@@ -1743,6 +1743,44 @@ async def cmd_unsubscribe(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def cmd_buy(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start a USDT subscription payment. Each user gets their own stable
+    USDT-TRC20 address (PortoAPI per-customer binding); paying it auto-activates
+    the subscription via the webhook. Until payments are live, says so."""
+    import porto
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    uid = user.id if user else chat_id
+    if quota.is_subscriber(uid):
+        await update.message.reply_text("💎 You're already a subscriber — thanks!")
+        return
+    if not porto.buying_enabled():
+        await update.message.reply_text(
+            "💳 Paid subscriptions are coming soon — crypto payments aren't live "
+            "yet. Hang tight, or message the admin to be notified."
+        )
+        return
+    try:
+        inv = await asyncio.to_thread(porto.create_invoice, uid)
+    except Exception:
+        log.exception("porto create_invoice failed")
+        await update.message.reply_text(
+            "⚠️ Couldn't start the payment right now — please try again shortly."
+        )
+        return
+    addr = inv.get("address", "")
+    amount = inv.get("amount", "")
+    uri = inv.get("payment_uri", "")
+    await update.message.reply_text(
+        "💳 *Subscribe with USDT (TRC-20)*\n\n"
+        f"Send exactly *{amount} USDT* to your personal address:\n`{addr}`\n\n"
+        + (f"One-tap: {uri}\n\n" if uri else "")
+        + "It's _your_ address — reuse it to renew anytime. Access activates "
+        "automatically once the payment confirms on-chain.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 async def cmd_feedback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Explicit user-feedback signal targeting the last completed run.
 
@@ -1946,20 +1984,30 @@ def _quota_prompt(ru: bool, limit: int) -> str:
     """Shown when a user hits their free-generation cap. Invites them to
     leave a subscription inquiry right in the chat (captured + forwarded)."""
     if ru:
-        return (
+        base = (
             "✨ Понравились идеи?\n\n"
             f"Вы использовали все {limit} бесплатных генераций идей.\n\n"
             "Чтобы продолжить — оставьте заявку на подписку прямо здесь: "
             "просто напишите сообщение (имя, контакт и что вам нужно), "
             "и мы свяжемся с вами."
         )
-    return (
-        "✨ Enjoying the ideas?\n\n"
-        f"You've used all {limit} free idea generations.\n\n"
-        "To keep going, leave your subscription inquiry right here — just "
-        "send a message (your name, contact, and what you need) and we'll "
-        "get back to you."
-    )
+    else:
+        base = (
+            "✨ Enjoying the ideas?\n\n"
+            f"You've used all {limit} free idea generations.\n\n"
+            "To keep going, leave your subscription inquiry right here — just "
+            "send a message (your name, contact, and what you need) and we'll "
+            "get back to you."
+        )
+    try:
+        import porto
+        if porto.buying_enabled():
+            base += ("\n\n💳 Или нажмите /buy — мгновенная подписка через USDT."
+                     if ru else
+                     "\n\n💳 Or tap /buy to subscribe instantly with USDT.")
+    except Exception:
+        pass
+    return base
 
 
 _INQUIRY_ACK_RU = "✅ Спасибо! Заявка передана — мы свяжемся с вами."
@@ -3048,6 +3096,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("resetquota", cmd_resetquota))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+    app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("corpus", cmd_corpus))
     app.add_handler(CommandHandler("feedback", cmd_feedback))
