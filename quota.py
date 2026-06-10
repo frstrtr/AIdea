@@ -16,12 +16,34 @@ import json
 import os
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # non-Unix — degrade to the in-process lock only
+    fcntl = None
+
 _PATH = Path(__file__).parent / "quota_state.json"
-# A threading lock is cheap insurance — the bot is single-threaded asyncio,
-# but the read-modify-write below must stay atomic regardless.
+# In-process lock (threads); the file lock below adds cross-process safety.
 _LOCK = threading.Lock()
+
+
+@contextmanager
+def _flock():
+    """Cross-process exclusive lock around the read-modify-write. aidea-web
+    (webhook activations) and aidea-bot (quota increments) are separate
+    processes writing the same quota file; a threading.Lock can't span them,
+    so without this two interleaved RMWs could lose each other's update."""
+    if fcntl is None:
+        yield
+        return
+    with open(_PATH.with_suffix(".lock"), "w") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def free_limit() -> int:
@@ -43,10 +65,8 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     # Atomic write — never leave a half-written quota file behind a crash.
-    # Per-process temp name: aidea-web (webhook activations) and aidea-bot
-    # (quota increments) both write this file, so a shared tmp path could
-    # collide. (Lost-update across processes is still possible but rare at
-    # this scale; a file lock would be the next hardening step.)
+    # Per-process temp name so two writers never collide on one tmp path;
+    # cross-process lost-update is prevented by _flock() around the RMW.
     tmp = _PATH.with_suffix(f".{os.getpid()}.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -86,7 +106,7 @@ def increment(
     """Add one to the user's generation count and persist. Returns new count."""
     now = time.time() if ts is None else ts
     key = str(user_id)
-    with _LOCK:
+    with _LOCK, _flock():
         data = _load()
         rec = data.get(key) or {"count": 0, "first_ts": now}
         rec["count"] = int(rec.get("count", 0)) + 1
@@ -105,7 +125,7 @@ def refund(user_id: int | str) -> int:
     """Undo one increment (e.g. the run errored or was cancelled before any
     ideas were delivered). Never goes below zero. Returns the new count."""
     key = str(user_id)
-    with _LOCK:
+    with _LOCK, _flock():
         data = _load()
         rec = data.get(key)
         if rec and int(rec.get("count", 0)) > 0:
@@ -119,7 +139,7 @@ def reset(user_id: int | str) -> int:
     """Admin: clear a user's count (e.g. after they subscribe). Returns the
     count they had before the reset."""
     key = str(user_id)
-    with _LOCK:
+    with _LOCK, _flock():
         data = _load()
         prior = int((data.get(key) or {}).get("count", 0))
         if key in data:
@@ -165,7 +185,7 @@ def set_subscriber(user_id: int | str, *, days: int = 30,
     now or the current expiry, so re-granting stacks. Returns the new expiry."""
     now = time.time() if now is None else now
     key = str(user_id)
-    with _LOCK:
+    with _LOCK, _flock():
         data = _load()
         rec = data.get(key) or {"count": 0, "first_ts": now}
         base = max(now, float(rec.get("subscribed_until") or 0))
@@ -179,7 +199,7 @@ def set_subscriber(user_id: int | str, *, days: int = 30,
 def clear_subscriber(user_id: int | str) -> None:
     """Revoke a subscription immediately."""
     key = str(user_id)
-    with _LOCK:
+    with _LOCK, _flock():
         data = _load()
         rec = data.get(key)
         if rec and rec.get("subscribed_until"):

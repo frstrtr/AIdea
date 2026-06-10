@@ -30,3 +30,4 @@ porto_processed.json
 .vscode/
 .idea/
 .DS_Store
+quota_state.lock

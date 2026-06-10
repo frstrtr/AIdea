@@ -49,7 +49,7 @@ from telegram import (
     ReplyKeyboardRemove,
     Update,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.helpers import escape_markdown
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
@@ -770,6 +770,11 @@ async def run_pipeline_for_telegram(
     extra: dict | None = None,
 ) -> None:
     chat_id = update.effective_chat.id
+    # DM-only: _STATES is keyed by chat_id, so running in a group would share
+    # one ChatState across all members (and let the bot generate inside the
+    # log group). Ignore non-private chats silently.
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return
     state = state_for(chat_id)
 
     # Free-tier quota. Counts interactive idea generations per Telegram
@@ -3136,7 +3141,12 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_message))
+    # Private chats only — _STATES is keyed by chat_id, so in a group all
+    # members would share one ChatState (busy / pending_topic / inquiry).
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        on_plain_message,
+    ))
     # Yes/No buttons for the plain-text confirmation flow.
     app.add_handler(CallbackQueryHandler(
         on_callback,
