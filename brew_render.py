@@ -202,7 +202,7 @@ def render_card(
 
 _FIELD_PATTERNS: list[tuple[str, list[str]]] = [
     # (target_field, list of candidate prefix labels — case-insensitive)
-    ("title",      ["title", "название", "загаловок"]),
+    ("title",      ["title", "название", "заголовок", "загаловок"]),
     ("pitch",      ["one-line pitch", "one line pitch", "однострочный питч",
                     "одностраничный питч", "питч в одну строку",
                     "одной строкой", "идея в одной фразе"]),

@@ -25,10 +25,9 @@ against — same auth model as the web app.
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
 import html
 import json
+import logging
 import os
 import random
 import time
@@ -51,6 +50,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
@@ -308,9 +308,13 @@ async def daily_summary_callback(context: Any) -> None:
     limit = quota.free_limit()
     table = quota.table()
     users = len(table)
-    walled = sum(1 for r in table.values() if int(r.get("count", 0)) >= limit)
-    used = sum(int(r.get("count", 0)) for r in table.values())
     subs = sum(1 for uid in table if quota.is_subscriber(uid))
+    # Subscribers aren't actually walled even if their free count hit the cap.
+    walled = sum(
+        1 for uid, r in table.items()
+        if int(r.get("count", 0)) >= limit and not quota.is_subscriber(uid)
+    )
+    used = sum(int(r.get("count", 0)) for r in table.values())
     try:
         u = summarize(run_id=None)
         wk = u.get("last_7d", {}) or {}
@@ -1207,8 +1211,10 @@ async def run_pipeline_for_telegram(
 
     except asyncio.CancelledError:
         transcript_log("request_errored", error="cancelled")
-        # The run was aborted before delivering ideas — give the slot back.
-        if quota_count is not None:
+        # Refund only if NOTHING was delivered — otherwise a user could
+        # /cancel after the ideas arrive (but before scoring) to dodge the
+        # free-tier wall. `ideas` may be unbound if cancelled during deck-gen.
+        if quota_count is not None and not locals().get("ideas"):
             quota.refund(user_id)
         return
     except Exception as e:
@@ -1216,8 +1222,9 @@ async def run_pipeline_for_telegram(
         transcript_log(
             "request_errored", error_type=type(e).__name__, error=str(e),
         )
-        # Failed run shouldn't cost the user a free generation.
-        if quota_count is not None:
+        # Failed run shouldn't cost a slot — unless ideas were already
+        # delivered before the failure (the user got value).
+        if quota_count is not None and not locals().get("ideas"):
             quota.refund(user_id)
         await _log_to_group(
             context, "errors",
@@ -1574,7 +1581,9 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = state_for(update.effective_chat.id).settings
     try:
         if key in ("cards", "n_concepts", "n_ideas"):
-            setattr(s, key, int(val))
+            # Clamp to >=1 so /set n_ideas=0 can't burn a free slot on an
+            # empty run (zero passes → zero ideas, still counted/logged).
+            setattr(s, key, max(1, int(val)))
         elif key == "seed":
             s.seed = int(val) if val.lower() not in ("", "none", "null") else None
         elif key in ("refine", "evolve_deck"):
@@ -1637,7 +1646,10 @@ async def cmd_quota(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                  f"{subs} subscriber(s))\n"]
         for uid, rec in ordered[:30]:
             c = int(rec.get("count", 0))
-            who = rec.get("name") or rec.get("username") or uid
+            # Escape user-controlled name/username for the Markdown roster.
+            who = escape_markdown(
+                str(rec.get("name") or rec.get("username") or uid), version=1,
+            )
             if quota.is_subscriber(uid):
                 tag = " 💎"
             elif c >= limit:
@@ -2075,7 +2087,12 @@ def _confirm_prompt(
 
     Yes is styled `success` (green), No is styled `danger` (red) — Bot API
     9.4 button colors, supported by python-telegram-bot ≥ 22.7."""
-    preview = topic[:300] + ("…" if len(topic) > 300 else "")
+    # Escape the user's topic — it's echoed into a Markdown message, so a
+    # stray * / _ / ` / [ would otherwise crash reply_text(parse_mode=MARKDOWN)
+    # and silently drop the whole confirmation card.
+    preview = escape_markdown(
+        topic[:300] + ("…" if len(topic) > 300 else ""), version=1,
+    )
     mode = s.mode or "default"
     n_ideas, n_reason = _effective_n_ideas(s)
     eta = estimate_runtime_seconds(mode, refine=bool(s.refine))

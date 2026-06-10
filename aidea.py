@@ -3031,6 +3031,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
                 mechanism=mechanisms_used[i] if i < len(mechanisms_used) else None,
                 feasibility=score["feasibility"],
                 unexpectedness=score["unexpectedness"],
+                uniqueness=score.get("uniqueness"),
                 topic_fit=score["topic_fit"],
                 total=total_score(score),
                 notes=score.get("notes", ""),

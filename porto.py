@@ -100,7 +100,8 @@ def _load_processed() -> dict:
 
 
 def _save_processed(data: dict) -> None:
-    tmp = _PROCESSED.with_suffix(".json.tmp")
+    # Per-process temp name so two writers never collide on one tmp path.
+    tmp = _PROCESSED.with_suffix(f".{os.getpid()}.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f)
     tmp.replace(_PROCESSED)
@@ -159,7 +160,15 @@ def handle_event(payload: dict) -> dict:
     tx = payload.get("transaction") or {}
     inv_id = invoice.get("invoice_id")
     tx_hash = tx.get("tx_hash")
-    key = tx_hash or f"inv:{inv_id}:{event}"
+    # Dedupe on tx_hash. Without it, fall back to invoice_id — but collapse
+    # all activating events to ONE key so a `paid` then `overpaid` for the
+    # same invoice can't double-credit; keep per-event keys for the rest.
+    if tx_hash:
+        key = tx_hash
+    elif event in _PAID_EVENTS:
+        key = f"inv:{inv_id}:paid"
+    else:
+        key = f"inv:{inv_id}:{event}"
 
     with _LOCK:
         if key in _load_processed():

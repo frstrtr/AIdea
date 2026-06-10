@@ -43,7 +43,11 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     # Atomic write — never leave a half-written quota file behind a crash.
-    tmp = _PATH.with_suffix(".json.tmp")
+    # Per-process temp name: aidea-web (webhook activations) and aidea-bot
+    # (quota increments) both write this file, so a shared tmp path could
+    # collide. (Lost-update across processes is still possible but rare at
+    # this scale; a file lock would be the next hardening step.)
+    tmp = _PATH.with_suffix(f".{os.getpid()}.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     tmp.replace(_PATH)
