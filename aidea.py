@@ -724,7 +724,6 @@ async def load_or_generate_deck(
     # threshold, force a fresh deck-gen + wildcard wander instruction.
     # Bypasses cache so the same topic for the same user actually gets
     # a different deck on consecutive runs once saturation is detected.
-    saturated = False
     try:
         from retention import donor_repeat_rate, SATURATION_THRESHOLD
         from transcripts import current_source
@@ -732,7 +731,6 @@ async def load_or_generate_deck(
         if src:
             rate = donor_repeat_rate(src, days=7)
             if rate >= SATURATION_THRESHOLD:
-                saturated = True
                 force_regen = True  # invalidate cache for this run
                 _saturated_run.set(True)
                 if verbose:

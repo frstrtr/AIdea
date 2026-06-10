@@ -15,10 +15,8 @@ AIdea synthesis into a shareable artifact.
 from __future__ import annotations
 
 import re
-import textwrap
 import time
 from pathlib import Path
-from typing import Iterable
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -224,7 +222,7 @@ def parse_idea_fields(text: str) -> dict[str, str]:
     buf: list[str] = []
 
     def _flush():
-        nonlocal buf, current_field
+        nonlocal buf  # current_field is only read here, not reassigned
         if current_field and buf:
             existing = out.get(current_field, "")
             joined = " ".join(buf).strip()

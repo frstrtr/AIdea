@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import random
 import time
 from pathlib import Path
@@ -35,7 +34,6 @@ from aidea import (
     EINSTEIN_MECHANISMS,
     ENTROPY_LEVELS,
     FUTURES_HORIZONS,
-    FUTURES_HORIZONS_BY_KEY,
     LSD_LABEL,
     LSD_VALIDATION_LABEL,
     LUCID_LABEL,

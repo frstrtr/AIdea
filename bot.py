@@ -830,7 +830,7 @@ async def run_pipeline_for_telegram(
             username=(tg_user.username if tg_user else ""),
         )
     try:
-        from rag import note_query, bootstrap_state, bootstrap_notice_text
+        from rag import note_query, bootstrap_notice_text
         bs = note_query(f"telegram-{chat_id}")
         if bs.get("active") and not state.bootstrap_notice_sent:
             notice = bootstrap_notice_text()
@@ -2608,7 +2608,6 @@ def _mode_label(key: str) -> str:
 
 
 def _settings_summary(s: "ChatSettings") -> str:
-    mode_lab = _mode_label("default")  # main menu always assumes default unless user picks
     return (
         f"Mode: default · "
         f"Entropy: {s.entropy} · "
@@ -2953,8 +2952,6 @@ async def _brew_worker_run(bot: Any, row: dict) -> None:
         sample_cards,
         build_prompt,
         synthesize,
-        critic_score,
-        total_score,
         parse_entropy,
         CARD_DEPTH_BY_NAME,
     )
@@ -2966,7 +2963,7 @@ async def _brew_worker_run(bot: Any, row: dict) -> None:
     topic = row["topic"]
     mode = (row.get("mode") or "default")
 
-    run_id = start_run(f"tg-{chat_id}")
+    start_run(f"tg-{chat_id}")  # tags usage records for this brew run
     set_source(f"telegram-{chat_id}")
     transcript_log(
         "request_started",
