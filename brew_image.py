@@ -86,7 +86,7 @@ Begin:"""
 
 async def generate_image_prompt(
     idea_fields: dict,
-    model: str = "claude-opus-4-7",
+    model: str = "claude-opus-4-8",
 ) -> str:
     """Single LLM call. Returns a scene description usable as an image-gen
     prompt. Falls back to a stringified title if the call fails — the
@@ -197,7 +197,7 @@ async def illustrate_idea(
     idea_fields: dict,
     output_path: Path,
     *,
-    model: str = "claude-opus-4-7",
+    model: str = "claude-opus-4-8",
 ) -> tuple[Path, str]:
     """Generate the visual-scene prompt + the image. Returns (png_path,
     scene_prompt). Caller composites the PNG with the text panel via

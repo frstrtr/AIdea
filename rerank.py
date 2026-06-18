@@ -112,7 +112,7 @@ async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--transcripts", default="transcripts.jsonl",
                     help="Path to transcripts.jsonl (default: ./transcripts.jsonl)")
-    ap.add_argument("--model", default="claude-opus-4-7",
+    ap.add_argument("--model", default="claude-opus-4-8",
                     help="Model for the critic call")
     ap.add_argument("--limit", type=int, default=0,
                     help="If >0, only process this many candidates")

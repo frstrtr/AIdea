@@ -473,7 +473,7 @@ class ChatSettings:
     card_depth: str = "medium"
     n_concepts: int = 3
     n_ideas: int = 3
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-4-8"
     # Audience register for the final idea: dummies | normal | expert.
     level: str = "normal"
     refine: bool = False
@@ -2981,7 +2981,7 @@ async def _brew_worker_run(bot: Any, row: dict) -> None:
         depth = CARD_DEPTH_BY_NAME["medium"]
         deck = await load_or_generate_deck(
             topic=topic, n=30, depth=depth,
-            model="claude-opus-4-7",
+            model="claude-opus-4-8",
             force_regen=False, verbose=False,
         )
         import random
@@ -2989,7 +2989,7 @@ async def _brew_worker_run(bot: Any, row: dict) -> None:
         cards = sample_cards(deck=deck, n=3, spread=spread, rng=rng)
         prompt = build_prompt(topic, cards, level)
         idea_text = await synthesize(
-            prompt=prompt, model="claude-opus-4-7", stream_to_stdout=False,
+            prompt=prompt, model="claude-opus-4-8", stream_to_stdout=False,
         )
         transcript_log(
             "idea", i=0, mechanism=None, text=idea_text,

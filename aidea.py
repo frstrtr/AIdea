@@ -2468,7 +2468,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--model",
         type=str,
-        default="claude-opus-4-7",
+        default="claude-opus-4-8",
         help="Model ID for the inference engine.",
     )
     p.add_argument(

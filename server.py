@@ -1130,11 +1130,11 @@ INDEX_HTML = r"""<!doctype html>
     </label>
     <label>Model
       <select name="model">
-        <option value="claude-opus-4-8" selected>Opus 4.8 — best (default)</option>
-        <option value="claude-opus-4-7">Opus 4.7</option>
-        <option value="claude-sonnet-4-6">Sonnet 4.6 — faster</option>
-        <option value="claude-haiku-4-5-20251001">Haiku 4.5 — fastest / cheapest</option>
-        <option value="claude-fable-5">Fable 5 — most creative</option>
+        <option value="claude-opus-4-8" selected>Best — v4.8 (default)</option>
+        <option value="claude-opus-4-7">Best — v4.7</option>
+        <option value="claude-sonnet-4-6">Balanced — v4.6</option>
+        <option value="claude-haiku-4-5-20251001">Fast / cheapest — v4.5</option>
+        <option value="claude-fable-5">Creative</option>
       </select>
     </label>
   </div>
