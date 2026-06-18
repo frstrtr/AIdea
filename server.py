@@ -73,7 +73,7 @@ class GenerateRequest(BaseModel):
     n_concepts: int = Field(3, ge=2, le=10)
     n_ideas: int = Field(3, ge=1, le=5)
     seed: int | None = None
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-4-8"
     level: str = "normal"  # final-idea register: dummies | normal | expert
     regen_deck: bool = False
     bank: str | None = None  # path to static JSON bank; bypasses deck-gen
@@ -1129,7 +1129,13 @@ INDEX_HTML = r"""<!doctype html>
       <input type="number" name="seed" placeholder="empty = random">
     </label>
     <label>Model
-      <input type="text" name="model" value="claude-opus-4-7">
+      <select name="model">
+        <option value="claude-opus-4-8" selected>Opus 4.8 — best (default)</option>
+        <option value="claude-opus-4-7">Opus 4.7</option>
+        <option value="claude-sonnet-4-6">Sonnet 4.6 — faster</option>
+        <option value="claude-haiku-4-5-20251001">Haiku 4.5 — fastest / cheapest</option>
+        <option value="claude-fable-5">Fable 5 — most creative</option>
+      </select>
     </label>
   </div>
 
