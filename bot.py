@@ -2599,6 +2599,25 @@ _DEPTH_INFO: list[tuple[str, str, str]] = [
     ("max",     "📚 Max",     "every field populated — slowest, most context"),
 ]
 
+# Model picker — keys are the real model IDs; labels stay vendor-neutral
+# (tier + version), matching the web dropdown.
+_MODEL_INFO: list[tuple[str, str, str]] = [
+    ("claude-opus-4-8",           "🥇 Best — v4.8",     "top quality (default)"),
+    ("claude-opus-4-7",           "🥈 Best — v4.7",     "previous top tier"),
+    ("claude-sonnet-4-6",         "⚖️ Balanced — v4.6", "faster, still strong"),
+    ("claude-haiku-4-5-20251001", "⚡ Fast — v4.5",      "fastest / cheapest"),
+    ("claude-fable-5",            "🎨 Creative",         "most divergent ideas"),
+]
+_MODEL_SHORT = {
+    "claude-opus-4-8": "v4.8", "claude-opus-4-7": "v4.7",
+    "claude-sonnet-4-6": "v4.6", "claude-haiku-4-5-20251001": "v4.5",
+    "claude-fable-5": "Creative",
+}
+
+
+def _model_short(model_id: str) -> str:
+    return _MODEL_SHORT.get(model_id, (model_id or "").replace("claude-", ""))
+
 
 def _mode_label(key: str) -> str:
     for k, lab, _ in _MODE_INFO:
@@ -2625,6 +2644,7 @@ def _main_menu_text(s: "ChatSettings") -> str:
         f"  · Mode: *{mode_lab}*\n"
         f"  · Entropy: *{s.entropy}*\n"
         f"  · Card depth: *{s.card_depth}*\n"
+        f"  · Model: *{_model_short(s.model)}*\n"
         f"  · Ideas per run: *{s.n_ideas}*\n"
         f"  · Refine winner: *{'on' if s.refine else 'off'}*\n\n"
         "Use the bottom buttons to change settings. To generate, just send "
@@ -2648,6 +2668,7 @@ _MAIN_MENU_PREFIXES: list[tuple[str, str]] = [
     ("🎲 Mode",     "open_mode"),
     ("🌪 Entropy",  "open_entropy"),
     ("📘 Depth",    "open_depth"),
+    ("🤖 Model",    "open_model"),
     ("🔧 Refine",   "toggle_refine"),
     ("📈 Usage",    "show_usage"),
     ("❓ Help",     "show_help"),
@@ -2686,11 +2707,12 @@ def _main_menu_kb(s: "ChatSettings") -> ReplyKeyboardMarkup:
                 KeyboardButton(f"📘 Depth: {s.card_depth}",       style="primary"),
             ],
             [
-                KeyboardButton(f"🔧 Refine: {refine_txt}", style="primary"),
-                KeyboardButton("📈 Usage",                 style="success"),
-                KeyboardButton("❓ Help",                  style="success"),
+                KeyboardButton(f"🤖 Model: {_model_short(s.model)}", style="primary"),
+                KeyboardButton(f"🔧 Refine: {refine_txt}",           style="primary"),
+                KeyboardButton("📈 Usage",                           style="success"),
             ],
             [
+                KeyboardButton("❓ Help",       style="success"),
                 KeyboardButton("🧭 Status",     style="success"),
                 KeyboardButton("✖ Hide menu",  style="danger"),
             ],
@@ -2777,6 +2799,17 @@ async def _handle_menu_action(
                 f"Current: *{s.card_depth}*"
             ),
             reply_markup=_picker_kb(_DEPTH_INFO, "depth", s.card_depth),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif action == "open_model":
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "*Model* — which engine generates the ideas.\n\n"
+                f"Current: *{_model_short(s.model)}*"
+            ),
+            reply_markup=_picker_kb(_MODEL_INFO, "model", s.model),
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -2922,6 +2955,20 @@ async def on_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             try:
                 await query.edit_message_text(
                     _confirm_edit("Card depth", key),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+            await _refresh_bottom_keyboard()
+
+    elif data.startswith("model:"):
+        key = data.split(":", 1)[1]
+        valid = {k for k, _, _ in _MODEL_INFO}
+        if key in valid:
+            s.model = key
+            try:
+                await query.edit_message_text(
+                    _confirm_edit("Model", _model_short(key)),
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception:
@@ -3152,7 +3199,7 @@ def build_app() -> Application:
     # Sub-pickers opened from the bottom-attached menu (Mode/Entropy/Depth).
     app.add_handler(CallbackQueryHandler(
         on_menu_callback,
-        pattern=r"^(mode:|entropy:|depth:)",
+        pattern=r"^(mode:|entropy:|depth:|model:)",
     ))
     # Scheduled-Brew queue: init the SQLite store and start the poller.
     # Runs every 60s, processes up to 5 due brews per tick serially.
